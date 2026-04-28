@@ -137,14 +137,19 @@ static func client_display_name(id: String) -> String:
 	return c.display_name if c != null else id
 
 
-static func configure(id: String) -> Dictionary:
+## Pass an explicit `url` when calling from a worker thread: `http_url()`
+## reads `EditorInterface.get_editor_settings()`, which is main-thread-only.
+## Empty defaults to the live server URL — appropriate for MCP-tool callers
+## that always run on main.
+static func configure(id: String, url: String = "") -> Dictionary:
 	var client := McpClientRegistry.get_by_id(id)
 	if client == null:
 		return {"status": "error", "message": "Unknown client: %s" % id}
 	## Capture `url` once so a port flip in EditorSettings between write and
 	## verify can't trigger a spurious CONFIGURED_MISMATCH against an entry
 	## that just landed correctly.
-	var url := http_url()
+	if url.is_empty():
+		url = http_url()
 	var result := _dispatch_configure(client, url)
 	## Trust-but-verify: a strategy may report ok and have actually written the
 	## file, yet the entry is missing/stale on the read-back path — most often
@@ -169,12 +174,21 @@ static func check_status_for_url(id: String, url: String) -> McpClient.Status:
 
 
 static func check_status_for_url_with_cli_path(id: String, url: String, cli_path: String) -> McpClient.Status:
+	return check_status_details_for_url_with_cli_path(id, url, cli_path).get("status", McpClient.Status.NOT_CONFIGURED)
+
+
+## Detailed variant used by the dock refresh worker. Returns
+## `{"status": Status, "error_msg": String}` so the worker can surface
+## "probe timed out" on the row instead of silently flipping it to
+## NOT_CONFIGURED. Callers that only need the status can use the simpler
+## helper above.
+static func check_status_details_for_url_with_cli_path(id: String, url: String, cli_path: String) -> Dictionary:
 	var client := McpClientRegistry.get_by_id(id)
 	if client == null:
-		return McpClient.Status.NOT_CONFIGURED
+		return {"status": McpClient.Status.NOT_CONFIGURED, "error_msg": ""}
 	if client.config_type == "cli" and cli_path.is_empty():
-		return McpClient.Status.NOT_CONFIGURED
-	return _dispatch_check_status_with_cli_path(client, url, cli_path)
+		return {"status": McpClient.Status.NOT_CONFIGURED, "error_msg": ""}
+	return _dispatch_check_status_with_cli_path_details(client, url, cli_path)
 
 
 static func client_status_probe_snapshot(id: String) -> Dictionary:
@@ -191,11 +205,15 @@ static func client_status_probe_snapshot(id: String) -> Dictionary:
 	return {"id": id, "cli_path": cli_path, "installed": installed}
 
 
-static func remove(id: String) -> Dictionary:
+## Pass an explicit `url` when calling from a worker thread — see
+## `configure()` above for why. The url is only used to format the
+## verify-after-write diagnostic message; the remove itself doesn't need it.
+static func remove(id: String, url: String = "") -> Dictionary:
 	var client := McpClientRegistry.get_by_id(id)
 	if client == null:
 		return {"status": "error", "message": "Unknown client: %s" % id}
-	var url := http_url()
+	if url.is_empty():
+		url = http_url()
 	var result := _dispatch_remove(client)
 	return _verify_post_state(client, result, McpClient.Status.NOT_CONFIGURED, url, "remove")
 
@@ -229,16 +247,20 @@ static func _dispatch_check_status(client: McpClient, url: String) -> McpClient.
 
 
 static func _dispatch_check_status_with_cli_path(client: McpClient, url: String, cli_path: String) -> McpClient.Status:
+	return _dispatch_check_status_with_cli_path_details(client, url, cli_path).get("status", McpClient.Status.NOT_CONFIGURED)
+
+
+static func _dispatch_check_status_with_cli_path_details(client: McpClient, url: String, cli_path: String) -> Dictionary:
 	match client.config_type:
 		"json":
-			return McpJsonStrategy.check_status(client, SERVER_NAME, url)
+			return {"status": McpJsonStrategy.check_status(client, SERVER_NAME, url), "error_msg": ""}
 		"toml":
-			return McpTomlStrategy.check_status(client, SERVER_NAME, url)
+			return {"status": McpTomlStrategy.check_status(client, SERVER_NAME, url), "error_msg": ""}
 		"cli":
 			if cli_path.is_empty():
-				return McpCliStrategy.check_status(client, SERVER_NAME, url)
-			return McpCliStrategy.check_status_with_cli_path(client, SERVER_NAME, url, cli_path)
-	return McpClient.Status.NOT_CONFIGURED
+				return McpCliStrategy.check_status_details(client, SERVER_NAME, url, McpCliStrategy.resolve_cli_path(client))
+			return McpCliStrategy.check_status_details(client, SERVER_NAME, url, cli_path)
+	return {"status": McpClient.Status.NOT_CONFIGURED, "error_msg": ""}
 
 
 ## After a configure/remove returns ok, re-read the live status. If it doesn't
