@@ -16,6 +16,71 @@ const EDITOR_LOGGER_PATH := "res://addons/godot_ai/runtime/editor_logger.gd"
 ## and manage a server it didn't spawn itself. See #135.
 const MANAGED_SERVER_PID_SETTING := "godot_ai/managed_server_pid"
 const MANAGED_SERVER_VERSION_SETTING := "godot_ai/managed_server_version"
+const MANAGED_SERVER_WS_PORT_SETTING := "godot_ai/managed_server_ws_port"
+const UPDATE_RELOAD_RUNNER_SCRIPT := preload("res://addons/godot_ai/update_reload_runner.gd")
+
+## Preloaded so `_stop_server` / `force_restart_server` can reference the
+## sweep without depending on the editor's `class_name` scan running first.
+## See utils/uv_cache_cleanup.gd for what this does and why it lives next
+## to the server-stop hot path.
+const UvCacheCleanup := preload("res://addons/godot_ai/utils/uv_cache_cleanup.gd")
+
+## Server lifecycle + port discovery extracted from this file (#297 PR 5).
+## State enums + version-check seam extracted in PR 6 (#297). Plugin.gd
+## keeps thin shims so the dock and characterization tests see an
+## unchanged public surface; spawn-machinery state now lives in the
+## lifecycle manager.
+const ServerLifecycleManager := preload("res://addons/godot_ai/utils/server_lifecycle.gd")
+const PortResolver := preload("res://addons/godot_ai/utils/port_resolver.gd")
+const ServerStateScript := preload("res://addons/godot_ai/utils/mcp_server_state.gd")
+const StartupPathScript := preload("res://addons/godot_ai/utils/mcp_startup_path.gd")
+
+## Plugin-class scripts — preloaded so `plugin.gd`'s parse and instantiation
+## sites resolve via the script path, not via the global `class_name`
+## registry. See the self-update parse-hazard policy near the field
+## declarations below for why every `Mcp*` plugin-class reference in this
+## file goes through one of these consts. Naming follows the existing
+## `UvCacheCleanup := preload(...)` convention (script-local const aliasing
+## a class whose registered `class_name` is `Mcp*`).
+const Connection := preload("res://addons/godot_ai/connection.gd")
+const Dispatcher := preload("res://addons/godot_ai/dispatcher.gd")
+const LogBuffer := preload("res://addons/godot_ai/utils/log_buffer.gd")
+const GameLogBuffer := preload("res://addons/godot_ai/utils/game_log_buffer.gd")
+const EditorLogBuffer := preload("res://addons/godot_ai/utils/editor_log_buffer.gd")
+const Dock := preload("res://addons/godot_ai/mcp_dock.gd")
+const DebuggerPlugin := preload("res://addons/godot_ai/debugger/mcp_debugger_plugin.gd")
+const ClientConfigurator := preload("res://addons/godot_ai/client_configurator.gd")
+const WindowsPortReservation := preload("res://addons/godot_ai/utils/windows_port_reservation.gd")
+
+## Handlers — preloaded as consts instead of registered via `class_name` so
+## they don't pollute the project-wide global scope. A user project that
+## happens to define its own `InputHandler`, `SceneHandler`, etc. would
+## otherwise hard-error on plugin enable.
+const EditorHandler := preload("res://addons/godot_ai/handlers/editor_handler.gd")
+const SceneHandler := preload("res://addons/godot_ai/handlers/scene_handler.gd")
+const NodeHandler := preload("res://addons/godot_ai/handlers/node_handler.gd")
+const ProjectHandler := preload("res://addons/godot_ai/handlers/project_handler.gd")
+const ClientHandler := preload("res://addons/godot_ai/handlers/client_handler.gd")
+const ScriptHandler := preload("res://addons/godot_ai/handlers/script_handler.gd")
+const ResourceHandler := preload("res://addons/godot_ai/handlers/resource_handler.gd")
+const FilesystemHandler := preload("res://addons/godot_ai/handlers/filesystem_handler.gd")
+const SignalHandler := preload("res://addons/godot_ai/handlers/signal_handler.gd")
+const AutoloadHandler := preload("res://addons/godot_ai/handlers/autoload_handler.gd")
+const InputHandler := preload("res://addons/godot_ai/handlers/input_handler.gd")
+const TestHandler := preload("res://addons/godot_ai/handlers/test_handler.gd")
+const BatchHandler := preload("res://addons/godot_ai/handlers/batch_handler.gd")
+const UiHandler := preload("res://addons/godot_ai/handlers/ui_handler.gd")
+const ThemeHandler := preload("res://addons/godot_ai/handlers/theme_handler.gd")
+const AnimationHandler := preload("res://addons/godot_ai/handlers/animation_handler.gd")
+const MaterialHandler := preload("res://addons/godot_ai/handlers/material_handler.gd")
+const ParticleHandler := preload("res://addons/godot_ai/handlers/particle_handler.gd")
+const CameraHandler := preload("res://addons/godot_ai/handlers/camera_handler.gd")
+const AudioHandler := preload("res://addons/godot_ai/handlers/audio_handler.gd")
+const PhysicsShapeHandler := preload("res://addons/godot_ai/handlers/physics_shape_handler.gd")
+const EnvironmentHandler := preload("res://addons/godot_ai/handlers/environment_handler.gd")
+const TextureHandler := preload("res://addons/godot_ai/handlers/texture_handler.gd")
+const CurveHandler := preload("res://addons/godot_ai/handlers/curve_handler.gd")
+const ControlDrawRecipeHandler := preload("res://addons/godot_ai/handlers/control_draw_recipe_handler.gd")
 
 ## The Python server writes its own PID here on startup (passed as
 ## `--pid-file`) and unlinks on clean exit. Deterministic replacement
@@ -23,7 +88,9 @@ const MANAGED_SERVER_VERSION_SETTING := "godot_ai/managed_server_version"
 ## Windows where `OS.kill` on the uvx launcher doesn't take the Python
 ## child with it, and the scrape was the only path to the real PID.
 ## See issue for #154-era Windows update friction.
-const SERVER_PID_FILE := "user://godot_ai_server.pid"
+## Re-export of PortResolver.SERVER_PID_FILE so the spawn flags, the
+## resolver, and characterization tests share one source of truth.
+const SERVER_PID_FILE := PortResolver.SERVER_PID_FILE
 
 ## How long we watch the spawned server for early exit. If the process is
 ## still alive when this expires, we stop watching. Mid-session crashes
@@ -34,79 +101,138 @@ const SERVER_WATCH_MS := 30 * 1000
 ## a spawn a crash until this window elapses so the watch loop has time to
 ## observe either the pid-file (dev venv) or the port listening (uvx).
 const SPAWN_GRACE_MS := 5 * 1000
+const SERVER_STATUS_PATH := "/godot-ai/status"
+const SERVER_STATUS_PROBE_TIMEOUT_MS := 800
+const SERVER_HANDSHAKE_VERSION_TIMEOUT_MS := 5 * 1000
+const STARTUP_TRACE_COUNTER_NAMES := [
+	"powershell",
+	"netstat",
+	"netsh",
+	"lsof",
+	"http_status_probe",
+	"server_command_discovery",
+]
 
-var _connection: Connection
-var _dispatcher: McpDispatcher
-var _log_buffer: McpLogBuffer
-var _game_log_buffer: GameLogBuffer
-var _editor_log_buffer: EditorLogBuffer
-## Untyped — script extends Godot 4.5+'s Logger class, loaded via load() so
-## the plugin still parses on 4.4. Null on Godot < 4.5 or before
-## `_attach_editor_logger` runs; "attached" state IS exactly "non-null".
+## Untyped on purpose — see policy below. Type fences move to handler `_init`
+## sites that take typed parameters.
+##
+## Self-update parse-hazard policy: plugin entry-load code MUST NOT
+## reference any plugin-defined `class_name` (`Mcp*`) by name — neither
+## as a type annotation (`var x: McpFoo`), nor as a constructor
+## (`McpFoo.new()`), nor as any other member access (`McpFoo.CONST`,
+## `McpFoo.static_method()`). Every form resolves through Godot's global
+## class_name registry at parse time. During an in-place self-update,
+## `set_plugin_enabled(false)` re-parses `plugin.gd` against the freshly-
+## extracted addon tree before the registry has scanned the new files; a
+## reference to a class whose inheritance or class_name siblings changed
+## in the new release fails to resolve, the plugin enters a degraded
+## state, and the follow-up `_exit_tree` cascade crashes (see #242,
+## #244). Static-var initializers are the most dangerous form because
+## they execute at script-load: `static var _x := McpFoo.BAR` aborts the
+## parse before `_enter_tree` runs.
+##
+## The mitigation is two-part:
+##   (1) Field declarations are untyped (this block).
+##   (2) Every other reference site uses script-local
+##       `const X := preload("res://...")` aliases declared at the top of
+##       the file (e.g. `Connection`, `Dispatcher`, `LogBuffer`,
+##       `ClientConfigurator`, `WindowsPortReservation`, …) — for
+##       constructors, constants, and static methods alike. `preload(...)`
+##       resolves the script by path at script-load, never consulting the
+##       global registry, so the parse stays clean across releases
+##       regardless of how the referenced class's `extends` chain or
+##       sibling class_names change.
+##
+## `tests/unit/test_plugin_self_update_safety.py` locks these forms in.
+##
+## `_editor_logger` was already untyped because its script extends Godot
+## 4.5+'s Logger class and is loaded via `load()` so the plugin still parses
+## on 4.4. Null on Godot < 4.5 or before `_attach_editor_logger` runs;
+## "attached" state IS exactly "non-null".
+var _connection
+var _dispatcher
+var _log_buffer
+var _game_log_buffer
+var _editor_log_buffer
 var _editor_logger
-var _dock: McpDock
-var _server_pid := -1
+var _dock
 var _handlers: Array = []  # prevent GC of RefCounted handlers
-var _debugger_plugin: McpDebuggerPlugin
+var _debugger_plugin
+## Spawn / stop / adopt orchestration plus state machine; allocated in
+## `_init` so test fixtures (which never enter the tree) can drive
+## `_start_server`. Owns `_server_pid`, `_server_state`, the version-
+## check seam, and the adoption-confirmation deadline — see
+## `utils/server_lifecycle.gd`.
+var _lifecycle
 static var _server_started_this_session := false  # guard against re-entrant spawns
+static var _resolved_ws_port := ClientConfigurator.DEFAULT_WS_PORT
 
-## Captured state for server-spawn supervision (see _start_server_watch).
-## Populated only when WE spawn the process — adopt / foreign-server
-## branches leave these at their defaults.
-var _server_spawn_ms: int = 0
-var _server_exit_ms: int = 0
+## Server-watch timer lives on the plugin because it's a Node — the
+## manager is RefCounted and can't host children.
 var _server_watch_timer: Timer = null
-## Outcome of the most recent `_start_server` attempt. One of the
-## `McpSpawnState.*` string constants; the dock switches on this to
-## decide which diagnostic panel to render. Default `OK` covers both
-## happy paths (spawned fresh / adopted existing). Failure states are
-## set at the exact point of failure and never cleared during the
-## plugin session — reload the plugin to retry.
-var _spawn_state: String = McpSpawnState.OK
-## One-shot guard for the stale-uvx-index recovery (see
-## `_should_retry_with_refresh`). Reset at the top of `_start_server` so
-## each fresh spawn attempt gets its own refresh budget; set to true the
-## moment we respawn with `--refresh` so a second failure falls through
-## to CRASHED instead of looping.
-var _refresh_retried: bool = false
-## Bounded deadline for `_watch_for_adoption_confirmation`. Zero when
-## disarmed. See that function's docstring.
-var _adoption_watch_deadline_ms: int = 0
+var _headless_disabled := false
+var _startup_trace_enabled := false
+var _startup_trace_start_ms := 0
+var _startup_trace_last_ms := 0
+var _startup_trace_counters: Dictionary = {}
+var _startup_trace_netsh_start_count := 0
+
+
+func _init() -> void:
+	_lifecycle = ServerLifecycleManager.new(self)
 
 
 func _enter_tree() -> void:
+	_startup_trace_begin()
+
 	## `_process` is only used by the adoption-confirmation watcher; keep
 	## it off until `_watch_for_adoption_confirmation` arms it, so the
 	## plugin has zero per-frame cost in the common case.
 	set_process(false)
 
+	if _mcp_disabled_for_headless_launch():
+		_headless_disabled = true
+		print("MCP | plugin disabled in headless mode")
+		return
+
 	## Register port overrides before spawn so `http_port()` / `ws_port()`
 	## return the user's configured values (if any) when `_start_server`
 	## builds the CLI args.
-	McpClientConfigurator.ensure_settings_registered()
+	ClientConfigurator.ensure_settings_registered()
+	_startup_trace_phase("settings_registered")
 
+	_log_buffer = LogBuffer.new()
 	_start_server()
+	_startup_trace_phase("server_start")
 
-	_log_buffer = McpLogBuffer.new()
 	_game_log_buffer = GameLogBuffer.new()
 	_editor_log_buffer = EditorLogBuffer.new()
 	_attach_editor_logger()
-	_dispatcher = McpDispatcher.new(_log_buffer)
+	_dispatcher = Dispatcher.new(_log_buffer)
+	_startup_trace_phase("core_objects")
 
 	_connection = Connection.new()
 	_connection.log_buffer = _log_buffer
+	_connection.ws_port = _resolved_ws_port
+	_connection.connect_blocked = _lifecycle.is_connection_blocked()
+	_connection.connect_block_reason = _lifecycle.get_status_dict().get("message", "")
+	if (
+		not _lifecycle.is_connection_blocked()
+		and not ServerStateScript.is_terminal_diagnosis(_lifecycle.get_state())
+	):
+		_arm_server_version_check()
 
-	_debugger_plugin = McpDebuggerPlugin.new(_log_buffer, _game_log_buffer)
+	_debugger_plugin = DebuggerPlugin.new(_log_buffer, _game_log_buffer)
 	add_debugger_plugin(_debugger_plugin)
 	_ensure_game_helper_autoload()
 
 	var editor_handler := EditorHandler.new(_log_buffer, _connection, _debugger_plugin, _game_log_buffer, _editor_log_buffer)
 	var scene_handler := SceneHandler.new(_connection)
 	var node_handler := NodeHandler.new(get_undo_redo())
-	var project_handler := ProjectHandler.new(_connection)
+	var project_handler := ProjectHandler.new(_connection, _debugger_plugin)
 	var client_handler := ClientHandler.new()
-	var script_handler := ScriptHandler.new(get_undo_redo())
-	var resource_handler := ResourceHandler.new(get_undo_redo())
+	var script_handler := ScriptHandler.new(get_undo_redo(), _connection)
+	var resource_handler := ResourceHandler.new(get_undo_redo(), _connection)
 	var filesystem_handler := FilesystemHandler.new()
 	var signal_handler := SignalHandler.new(get_undo_redo())
 	var autoload_handler := AutoloadHandler.new()
@@ -121,9 +247,9 @@ func _enter_tree() -> void:
 	var camera_handler := CameraHandler.new(get_undo_redo())
 	var audio_handler := AudioHandler.new(get_undo_redo())
 	var physics_shape_handler := PhysicsShapeHandler.new(get_undo_redo())
-	var environment_handler := EnvironmentHandler.new(get_undo_redo())
-	var texture_handler := TextureHandler.new(get_undo_redo())
-	var curve_handler := CurveHandler.new(get_undo_redo())
+	var environment_handler := EnvironmentHandler.new(get_undo_redo(), _connection)
+	var texture_handler := TextureHandler.new(get_undo_redo(), _connection)
+	var curve_handler := CurveHandler.new(get_undo_redo(), _connection)
 	var control_draw_recipe_handler := ControlDrawRecipeHandler.new(get_undo_redo())
 	_handlers = [editor_handler, scene_handler, node_handler, project_handler, client_handler, script_handler, resource_handler, filesystem_handler, signal_handler, autoload_handler, input_handler, test_handler, batch_handler, ui_handler, theme_handler, animation_handler, material_handler, particle_handler, camera_handler, audio_handler, physics_shape_handler, environment_handler, texture_handler, curve_handler, control_draw_recipe_handler]
 
@@ -255,21 +381,30 @@ func _enter_tree() -> void:
 
 	_connection.dispatcher = _dispatcher
 	add_child(_connection)
+	_startup_trace_phase("handlers_registered")
 
 	# Dock panel
-	_dock = McpDock.new()
+	_dock = Dock.new()
 	_dock.name = "Godot AI"
 	_dock.setup(_connection, _log_buffer, self)
 	add_control_to_dock(DOCK_SLOT_RIGHT_BL, _dock)
+	_startup_trace_phase("dock_attached")
 
 	_log_buffer.log("plugin loaded")
+	var startup_path: String = str(_lifecycle.get_startup_path())
+	_startup_trace_finish(startup_path if not startup_path.is_empty() else "loaded")
 
 
 func _exit_tree() -> void:
+	if _headless_disabled:
+		_server_started_this_session = false
+		_headless_disabled = false
+		return
+
 	## Outer-to-inner teardown. Dispatcher Callables hold RefCounted handlers
 	## alive past the point where Godot reloads their class_name scripts — the
 	## first post-reload call into a typed-array-holding handler (e.g.
-	## GameLogBuffer._storage) then SIGSEGVs against a stale class descriptor.
+	## McpGameLogBuffer._storage) then SIGSEGVs against a stale class descriptor.
 	## See issue #46.
 
 	# Stop inbound work first so _process can't enqueue new commands or
@@ -353,7 +488,43 @@ func _detach_editor_logger() -> void:
 ## framebuffer captures over EngineDebugger messages. Removed on
 ## _disable_plugin so disabling the plugin leaves project.godot clean.
 func _enable_plugin() -> void:
+	if _mcp_disabled_for_headless_launch():
+		return
 	_ensure_game_helper_autoload()
+
+
+static func _mcp_disabled_for_headless_launch() -> bool:
+	return _mcp_disabled_for_headless(
+		OS.get_cmdline_args(),
+		DisplayServer.get_name(),
+		OS.get_environment("GODOT_AI_ALLOW_HEADLESS")
+	)
+
+
+static func _mcp_disabled_for_headless(args: PackedStringArray, display_name: String, allow_value: String) -> bool:
+	if _env_truthy(allow_value):
+		return false
+	return _args_request_headless(args) or display_name.to_lower() == "headless"
+
+
+static func _args_request_headless(args: PackedStringArray) -> bool:
+	for i in range(args.size()):
+		var arg := args[i]
+		if arg == "--headless":
+			return true
+		if arg == "--display-driver" and i + 1 < args.size() and args[i + 1] == "headless":
+			return true
+		if arg.begins_with("--display-driver=") and arg.get_slice("=", 1) == "headless":
+			return true
+	return false
+
+
+static func _env_truthy(value: String) -> bool:
+	match value.strip_edges().to_lower():
+		"1", "true", "yes", "on":
+			return true
+		_:
+			return false
 
 
 func _disable_plugin() -> void:
@@ -384,138 +555,211 @@ func _ensure_game_helper_autoload() -> void:
 			% [GAME_HELPER_AUTOLOAD_NAME, err])
 
 
+func _startup_trace_begin() -> void:
+	_startup_trace_enabled = ClientConfigurator.startup_trace_enabled()
+	if not _startup_trace_enabled:
+		return
+	_startup_trace_start_ms = Time.get_ticks_msec()
+	_startup_trace_last_ms = _startup_trace_start_ms
+	_startup_trace_netsh_start_count = WindowsPortReservation.netsh_query_count()
+	_startup_trace_counters.clear()
+	for counter in STARTUP_TRACE_COUNTER_NAMES:
+		_startup_trace_counters[counter] = 0
+	print(
+		"MCP startup trace | begin platform=%s http_port=%d ws_port=%d"
+		% [
+			OS.get_name(),
+			ClientConfigurator.http_port(),
+			ClientConfigurator.ws_port(),
+		]
+	)
+
+
+func _startup_trace_count(counter: String, amount: int = 1) -> void:
+	if not _startup_trace_enabled:
+		return
+	_startup_trace_counters[counter] = int(_startup_trace_counters.get(counter, 0)) + amount
+
+
+func _startup_trace_phase(name: String) -> void:
+	if not _startup_trace_enabled:
+		return
+	var now := Time.get_ticks_msec()
+	print(
+		"MCP startup trace | phase=%s delta_ms=%d total_ms=%d"
+		% [name, now - _startup_trace_last_ms, now - _startup_trace_start_ms]
+	)
+	_startup_trace_last_ms = now
+
+
+func _startup_trace_finish(path: String) -> void:
+	if not _startup_trace_enabled:
+		return
+	var now := Time.get_ticks_msec()
+	_startup_trace_counters["netsh"] = (
+		WindowsPortReservation.netsh_query_count() - _startup_trace_netsh_start_count
+	)
+	print(
+		"MCP startup trace | done path=%s total_ms=%d counters=%s"
+		% [path, now - _startup_trace_start_ms, str(_startup_trace_counters)]
+	)
+
+
 func _start_server() -> void:
-	## Branch on port state + EditorSettings record. The record lets a
-	## later editor session recognize and manage a server it didn't spawn
-	## itself; treating the stored `version` (not `pid`) as the "is this
-	## ours?" signal handles the uvx tier, where the recorded PID is a
-	## launcher that has long since exited. See #135 and #137.
-	##
-	##   port free                            -> spawn fresh, record PID
-	##   port in use, record.version matches  -> adopt the port owner
-	##                                              (self-heals stale PID)
-	##   port in use, record.version drifts   -> kill port owner + respawn
-	##                                              (fixes cold-start drift
-	##                                              from manual file replace)
-	##   port in use, no matching record      -> foreign server, leave alone
-	if _server_started_this_session:
-		## Guard against re-entrant spawns (e.g. plugin reload during update).
-		## The static flag persists across disable/enable cycles within the
-		## same editor session, preventing cascading server process creation.
-		return
+	_lifecycle.start_server()
 
-	_refresh_retried = false
 
-	var port := McpClientConfigurator.http_port()
-	var ws_port := McpClientConfigurator.ws_port()
-	var current_version := McpClientConfigurator.get_plugin_version()
+## Test-fixture shim — characterization tests in test_plugin_lifecycle
+## reach for this instance method directly. Delegates to the manager's
+## state-owning copy.
+func _set_incompatible_server(live: Dictionary, expected_version: String, port: int) -> void:
+	_lifecycle._set_incompatible_server(live, expected_version, port)
 
-	if _is_port_in_use(port):
-		var record := _read_managed_server_record()
-		if record.version == current_version:
-			## Version matches — this port is owned by a server we spawned
-			## at some point. Adopt the live port owner, ignoring any stale
-			## launcher PID that may still be in the record. Self-heal the
-			## record so next session's adopt can fast-path.
-			var owner := _find_managed_pid(port)
-			if owner > 0:
-				_server_pid = owner
-				_write_managed_server_record(owner, current_version)
-			_server_started_this_session = true
-			print("MCP | adopted managed server (PID %d, v%s)" % [_server_pid, current_version])
-			return
-		if not record.version.is_empty():
-			## Version drift — our server but the plugin moved on. Kill
-			## the port owner (not the stale launcher PID) and respawn
-			## to match the current plugin version.
-			print("MCP | managed server v%s does not match plugin v%s, restarting"
-				% [record.version, current_version])
-			var owner := _find_managed_pid(port)
-			if owner > 0:
-				OS.kill(owner)
-			_clear_managed_server_record()
-			_clear_pid_file()
-			_wait_for_port_free(port, 3.0)
-			## Fall through to spawn.
+
+## Static shim — kept on the plugin class because the characterization
+## tests assert against `GodotAiPlugin._incompatible_server_message`.
+## Implementation moved to ServerLifecycleManager.
+static func _incompatible_server_message(
+	live: Dictionary,
+	expected_version: String,
+	port: int,
+	expected_ws_port: int
+) -> String:
+	return ServerLifecycleManager._incompatible_server_message(
+		live, expected_version, port, expected_ws_port
+	)
+
+
+static func _server_version_compatibility(
+	actual_version: String, expected_version: String, is_dev_checkout: bool
+) -> Dictionary:
+	return ServerLifecycleManager._server_version_compatibility(
+		actual_version, expected_version, is_dev_checkout
+	)
+
+
+static func _server_status_compatibility(
+	actual_version: String,
+	expected_version: String,
+	actual_ws_port: int,
+	expected_ws_port: int,
+	is_dev_checkout: bool,
+) -> Dictionary:
+	return ServerLifecycleManager._server_status_compatibility(
+		actual_version, expected_version, actual_ws_port, expected_ws_port, is_dev_checkout
+	)
+
+
+static func _managed_record_has_version_drift(record_version: String, current_version: String) -> bool:
+	return ServerLifecycleManager._managed_record_has_version_drift(record_version, current_version)
+
+
+static func _probe_live_server_status(port: int, timeout_ms: int = SERVER_STATUS_PROBE_TIMEOUT_MS) -> Dictionary:
+	var result := {
+		"reachable": false,
+		"version": "",
+		"name": "",
+		"ws_port": 0,
+		"status_code": 0,
+		"error": "",
+	}
+	var client := HTTPClient.new()
+	var err := client.connect_to_host("127.0.0.1", port)
+	if err != OK:
+		result["error"] = "connect_%d" % err
+		return result
+	var deadline := Time.get_ticks_msec() + timeout_ms
+	while client.get_status() == HTTPClient.STATUS_RESOLVING or client.get_status() == HTTPClient.STATUS_CONNECTING:
+		client.poll()
+		if Time.get_ticks_msec() >= deadline:
+			result["error"] = "connect_timeout"
+			return result
+		OS.delay_msec(10)
+	if client.get_status() != HTTPClient.STATUS_CONNECTED:
+		result["error"] = "connect_status_%d" % client.get_status()
+		return result
+	err = client.request(HTTPClient.METHOD_GET, SERVER_STATUS_PATH, ["Accept: application/json"])
+	if err != OK:
+		result["error"] = "request_%d" % err
+		return result
+	var body := PackedByteArray()
+	while true:
+		var status := client.get_status()
+		if status == HTTPClient.STATUS_REQUESTING:
+			client.poll()
+		elif status == HTTPClient.STATUS_BODY:
+			client.poll()
+			var chunk := client.read_response_body_chunk()
+			if chunk.size() > 0:
+				body.append_array(chunk)
+		elif status == HTTPClient.STATUS_CONNECTED:
+			break
 		else:
-			## No record claiming this port. Could be a non-MCP process
-			## (the handshake will never succeed → user sees FOREIGN_PORT
-			## and picks a different port) OR another editor's MCP server
-			## whose managed-record we just don't have locally — in which
-			## case our WebSocket WILL open and the diagnostic would be a
-			## lie. Flag FOREIGN_PORT preemptively, and arm a one-shot
-			## watcher that clears it if adoption actually succeeds.
-			_server_started_this_session = true
-			_set_spawn_state(McpSpawnState.FOREIGN_PORT)
-			_watch_for_adoption_confirmation()
-			print("MCP | foreign server already running on port %d, using existing" % port)
-			return
-
-	var server_cmd := McpClientConfigurator.get_server_command()
-	if server_cmd.is_empty():
-		_set_spawn_state(McpSpawnState.NO_COMMAND)
-		push_warning("MCP | could not find server command")
-		return
-
-	var cmd: String = server_cmd[0]
-	var args: Array[String] = []
-	args.assign(server_cmd.slice(1))
-	args.append_array(_build_server_flags(port, ws_port))
-
-	## Wipe any stale pid-file before spawning so a failed launch can't
-	## leave last session's PID sitting there for _find_managed_pid to
-	## read and act on.
-	_clear_pid_file()
-
-	## Proactive Windows port-reservation check. WinError 10013 surfaces as
-	## an otherwise-silent spawn-then-exit because nothing owns the port;
-	## netstat shows nothing and the dock's reconnect spinner climbs
-	## forever. Catch it before we even try and skip the spawn entirely —
-	## the port picker is the only useful next step. See issue #146.
-	if WindowsPortReservation.is_port_excluded(port):
-		_server_started_this_session = true
-		_set_spawn_state(McpSpawnState.PORT_EXCLUDED)
-		push_warning("MCP | port %d is reserved by Windows (Hyper-V / WSL2 / Docker)" % port)
-		return
-
-	## `OS.create_process` rather than `execute_with_pipe`: the pipe path
-	## had two Windows failure modes. (1) `execute_with_pipe` returned a
-	## shim PID that exited within ~100 ms after spawning the real Python —
-	## the watch loop then falsely reported "server exited" while Python
-	## was happily running. (2) Python's startup writes (Rich banner +
-	## uvicorn logs) overflowed the ~4 KB pipe buffer before the plugin
-	## drained it, stalling stdout and wedging the server before it could
-	## even write `--pid-file`. Result on every Windows dev-venv launch:
-	## empty crash panel + "server exited after 2–3 s" with no traceback.
-	## `create_process` returns the real Python PID and doesn't subject
-	## the child to pipe-buffer backpressure. We lose the captured stdout
-	## the dock used to render — Python's traceback goes to Godot's output
-	## log instead, which the crash-panel hint now points at.
-	_server_pid = OS.create_process(cmd, args)
-	if _server_pid > 0:
-		_server_spawn_ms = Time.get_ticks_msec()
-		_server_exit_ms = 0
-		_server_started_this_session = true
-		## Record the launcher PID immediately so a same-session
-		## prepare_for_update_reload has something to kill. On the next
-		## editor start, _start_server's adopt branch self-heals the PID
-		## to the actual port owner (uvx's child).
-		_write_managed_server_record(_server_pid, current_version)
-		print("MCP | started server (PID %d, v%s): %s %s" % [_server_pid, current_version, cmd, " ".join(args)])
-		_start_server_watch()
-	else:
-		_set_spawn_state(McpSpawnState.CRASHED)
-		push_warning("MCP | failed to start server")
+			result["error"] = "response_status_%d" % status
+			return result
+		if Time.get_ticks_msec() >= deadline:
+			result["error"] = "response_timeout"
+			return result
+		OS.delay_msec(10)
+	var response_code := client.get_response_code()
+	result["status_code"] = response_code
+	if response_code != 200:
+		result["error"] = "http_%d" % response_code
+		return result
+	var parsed = JSON.parse_string(body.get_string_from_utf8())
+	if not (parsed is Dictionary):
+		result["error"] = "invalid_json"
+		return result
+	result["reachable"] = true
+	result["name"] = str(parsed.get("name", ""))
+	result["version"] = _extract_server_version(parsed)
+	result["ws_port"] = int(parsed.get("ws_port", 0))
+	return result
 
 
-## Record a non-OK spawn outcome. First writer wins: once a specific
-## diagnosis lands (e.g. PORT_EXCLUDED during the proactive check),
-## later fallback paths (e.g. CRASHED from the watch loop) don't
-## overwrite the more actionable state.
-func _set_spawn_state(state: String) -> void:
-	if _spawn_state != McpSpawnState.OK:
-		return
-	_spawn_state = state
+func _probe_live_server_status_for_port(port: int) -> Dictionary:
+	_startup_trace_count("http_status_probe")
+	return _probe_live_server_status(port)
+
+
+static func _extract_server_version(payload: Dictionary) -> String:
+	var version := str(payload.get("server_version", ""))
+	if version.is_empty():
+		version = str(payload.get("version", ""))
+	return version
+
+
+static func _live_status_identifies_godot_ai(live: Dictionary) -> bool:
+	return ServerLifecycleManager._live_status_identifies_godot_ai(live)
+
+
+func _verified_status_version(live: Dictionary) -> String:
+	if not ServerLifecycleManager._live_status_identifies_godot_ai(live):
+		return ""
+	return str(live.get("version", ""))
+
+
+func _verified_status_ws_port(live: Dictionary) -> int:
+	if not ServerLifecycleManager._live_status_identifies_godot_ai(live):
+		return 0
+	return int(live.get("ws_port", 0))
+
+
+func _refresh_dock_client_statuses() -> bool:
+	if _dock == null:
+		return false
+	if not _dock.has_method("_refresh_all_client_statuses"):
+		return false
+	_dock.call("_refresh_all_client_statuses")
+	return true
+
+
+## Test-fixture shim — characterization tests in test_plugin_lifecycle
+## still drive the first-writer-wins terminal-diagnosis behaviour through
+## this method. Delegates to the manager's `set_terminal_diagnosis`
+## (which preserves the same first-writer-wins contract).
+func _set_spawn_state(state: int) -> void:
+	_lifecycle.set_terminal_diagnosis(state)
 
 
 ## Arm the one-shot connection watcher. Called from `_start_server`'s
@@ -525,39 +769,67 @@ func _set_spawn_state(state: String) -> void:
 ## diagnostic.
 ##
 ## We intentionally poll `_connection.is_connected` from `_process`
-## instead of wiring a new signal on Connection — signals would be
-## cleaner, but `class_name Connection` is cached by the editor across
+## instead of wiring a new signal on McpConnection — signals would be
+## cleaner, but `class_name McpConnection` is cached by the editor across
 ## plugin disable/enable, and a self-update that added a new signal
 ## crashes `_enter_tree` with "invalid access to property" until the
 ## user restarts Godot. Polling only reads `is_connected` (present on
-## every shipped Connection), so upgrades stay hot-reloadable.
+## every shipped McpConnection), so upgrades stay hot-reloadable.
 ##
 ## The watch self-disarms after SPAWN_GRACE_MS so per-frame cost drops
-## back to zero even if the foreign occupant never opens a WebSocket.
+## back to zero if it is ever armed by a legacy adoption path.
 func _watch_for_adoption_confirmation() -> void:
-	_adoption_watch_deadline_ms = Time.get_ticks_msec() + SPAWN_GRACE_MS
-	set_process(true)
+	_lifecycle.arm_adoption_watch()
+	_update_process_enabled()
+
+
+func _arm_server_version_check() -> void:
+	## `arm_version_check` resolves an empty expected via the plugin
+	## version, so we can pass the raw field value through.
+	_lifecycle.arm_version_check(_connection, str(_lifecycle._server_expected_version))
+	_update_process_enabled()
+
+
+func _update_process_enabled() -> void:
+	set_process(
+		_lifecycle.get_adoption_watch_deadline_ms() > 0
+		or _lifecycle.is_awaiting_server_version()
+	)
 
 
 func _process(_delta: float) -> void:
-	if _connection != null and _connection.is_connected:
-		_on_connection_established()
-		_adoption_watch_deadline_ms = 0
-		set_process(false)
-		return
-	if Time.get_ticks_msec() >= _adoption_watch_deadline_ms:
-		_adoption_watch_deadline_ms = 0
-		set_process(false)
+	var now := Time.get_ticks_msec()
+	var version_check = _lifecycle.get_version_check()
+	if version_check != null:
+		version_check.tick(now)
+	_lifecycle.tick_adoption_watch(now)
+	_update_process_enabled()
 
 
-## Bypasses `_set_spawn_state`'s first-writer-wins guard: the WebSocket
-## opening proves the occupant is a compatible MCP server (another
-## editor's session), so the preemptive FOREIGN_PORT diagnostic was a
-## false alarm and the dock shouldn't render the banner next to the
-## green "Connected" dot.
+## A WebSocket opening only proves the occupant speaks enough of the editor
+## protocol to accept a session. Compatibility is decided by the server
+## version in `handshake_ack`, so this only arms that check.
 func _on_connection_established() -> void:
-	if _spawn_state == McpSpawnState.FOREIGN_PORT:
-		_spawn_state = McpSpawnState.OK
+	if _lifecycle.get_state() == ServerStateScript.FOREIGN_PORT:
+		_arm_server_version_check()
+
+
+## Test-fixture shim — characterization tests poke the verified path
+## directly. Delegates to the version-check seam; the manager resolves
+## an empty expected version via `_resolve_expected_version`.
+func _on_server_version_verified(version: String) -> void:
+	_lifecycle.handle_server_version_verified(
+		str(_lifecycle._server_expected_version), version
+	)
+	_update_process_enabled()
+
+
+## Test-fixture shim — same shape as `_on_server_version_verified`.
+func _on_server_version_unverified() -> void:
+	_lifecycle.handle_server_version_unverified(
+		str(_lifecycle._server_expected_version)
+	)
+	_update_process_enabled()
 
 
 ## Start a 1s-tick timer that watches the spawned server for up to
@@ -583,34 +855,7 @@ func _stop_server_watch() -> void:
 
 
 func _check_server_health() -> void:
-	if _server_pid <= 0:
-		_stop_server_watch()
-		return
-	var elapsed := Time.get_ticks_msec() - _server_spawn_ms
-	## Python writes its real PID to `--pid-file` right after argparse —
-	## before the heavy imports. On Windows launchers (uvx) the direct
-	## child can exit quickly after spawning the real interpreter, so the
-	## pid-file is more reliable than `_server_pid` for liveness. Adopt
-	## the real PID whenever we see a live one; fall back to _server_pid
-	## otherwise.
-	var real_pid := _read_pid_file()
-	if real_pid > 0 and real_pid != _server_pid and _pid_alive(real_pid):
-		_server_pid = real_pid
-	elif not _pid_alive(_server_pid):
-		if elapsed >= SPAWN_GRACE_MS and _spawn_state == McpSpawnState.OK:
-			if _should_retry_with_refresh():
-				_refresh_retried = true
-				_respawn_with_refresh()
-				return
-			_server_exit_ms = elapsed
-			_set_spawn_state(McpSpawnState.CRASHED)
-			_log_buffer.log("server exited after %dms — see Godot output log" % _server_exit_ms)
-			_stop_server_watch()
-		return
-	if elapsed >= SERVER_WATCH_MS:
-		## Server survived startup — stop watching. Mid-session crashes
-		## after this point surface via the WebSocket disconnect path.
-		_stop_server_watch()
+	_lifecycle.check_server_health()
 
 
 ## True when the first spawn looks like a stale-uvx-index failure and we
@@ -624,8 +869,8 @@ func _check_server_health() -> void:
 ## restart, crash recovery) — unlike the older Update-only precheck.
 func _should_retry_with_refresh() -> bool:
 	return _retry_with_refresh_allowed(
-		_refresh_retried,
-		McpClientConfigurator.get_server_launch_mode(),
+		_lifecycle._refresh_retried,
+		ClientConfigurator.get_server_launch_mode(),
 		_read_pid_file(),
 	)
 
@@ -641,126 +886,112 @@ static func _retry_with_refresh_allowed(already_retried: bool, launch_mode: Stri
 	)
 
 
-## Re-run `OS.create_process` with `--refresh` prepended to the uvx args
-## and reset the watch-loop baseline so the next tick evaluates the new
-## process, not the dead one. Does NOT flip `_server_started_this_session`
-## again (already true), does NOT touch the managed-server record (the
-## launcher PID is disposable — what matters is the Python child, which
-## writes its own pid-file if it gets that far).
 func _respawn_with_refresh() -> void:
-	var server_cmd := McpClientConfigurator.get_server_command(true)
-	if server_cmd.is_empty():
-		## Can't happen in practice — we only reach here after a successful
-		## first resolve of `get_server_command()` at the top of `_start_server`
-		## — but keep the shape symmetric so a future refactor doesn't silently
-		## break the retry.
-		return
-	var cmd: String = server_cmd[0]
-	var args: Array[String] = []
-	args.assign(server_cmd.slice(1))
-	args.append_array(_build_server_flags(McpClientConfigurator.http_port(), McpClientConfigurator.ws_port()))
-	_clear_pid_file()
-	_log_buffer.log("retrying with --refresh (PyPI index may be stale)")
-	_server_pid = OS.create_process(cmd, args)
-	if _server_pid > 0:
-		_server_spawn_ms = Time.get_ticks_msec()
-		_server_exit_ms = 0
-		var current_version := McpClientConfigurator.get_plugin_version()
-		_write_managed_server_record(_server_pid, current_version)
-		print("MCP | retried server (PID %d, v%s): %s %s" % [_server_pid, current_version, cmd, " ".join(args)])
-	else:
-		## OS.create_process returned -1 on the retry — can't distinguish this
-		## from a real crash, so surface CRASHED immediately rather than
-		## looping. `_refresh_retried` is already true so we won't try again.
-		_set_spawn_state(McpSpawnState.CRASHED)
-		_log_buffer.log("refresh retry failed to spawn — see Godot output log")
-		_stop_server_watch()
+	_lifecycle.respawn_with_refresh()
 
 
 ## Snapshot of the server-spawn outcome for the dock.
 ##
-## `state` is one of the `McpSpawnState.*` constants; the dock owns the
-## UI copy per state via its own `_crash_body_for_state`. `exit_ms` is
-## only meaningful for `CRASHED`.
+## `state` is one of the `McpServerState.*` int constants; the dock owns
+## the UI copy per state via its own `_crash_body_for_state`. `exit_ms`
+## is only meaningful for `CRASHED`.
 func get_server_status() -> Dictionary:
-	return {
-		"state": _spawn_state,
-		"exit_ms": _server_exit_ms,
-	}
+	return _lifecycle.get_status_dict()
 
 
+func get_resolved_ws_port() -> int:
+	return _resolved_ws_port
+
+
+func _set_resolved_ws_port(port: int) -> void:
+	_resolved_ws_port = port
+	if _connection != null:
+		_connection.ws_port = port
+
+
+func _resolve_ws_port() -> int:
+	return PortResolver.resolve_ws_port(
+		ClientConfigurator.ws_port(),
+		ClientConfigurator.MAX_PORT,
+		_log_buffer,
+	)
+
+
+## Test-compat shim — characterization tests call this static directly.
+static func _resolved_ws_port_for_existing_server(
+	record_ws_port: int,
+	record_version: String,
+	current_version: String,
+	fresh_resolved: int
+) -> int:
+	return PortResolver.resolved_ws_port_for_existing_server(
+		record_ws_port,
+		record_version,
+		current_version,
+		fresh_resolved,
+	)
+
+
+static func _resolve_ws_port_from_output(
+	configured_port: int,
+	netsh_output: String,
+	span: int = 2048
+) -> int:
+	return PortResolver.resolve_ws_port_from_output(
+		configured_port,
+		netsh_output,
+		ClientConfigurator.MAX_PORT,
+		span,
+	)
+
+
+## Plugin-level shim around the resolver — keeps the startup-trace
+## counter increment and the `_ProofPlugin` override hook on the plugin.
 func _is_port_in_use(port: int) -> bool:
-	var output: Array = []
+	if PortResolver.can_bind_local_port(port):
+		## POSIX can still have an IPv6 wildcard listener on this port
+		## even when an IPv4 loopback bind succeeds. Confirm through
+		## lsof so startup and kill-path discovery agree.
+		if OS.get_name() != "Windows":
+			_startup_trace_count("lsof")
+			return PortResolver.is_port_in_use_via_scrape(port)
+		return false
 	if OS.get_name() == "Windows":
-		var exit_code := OS.execute("netstat", ["-ano"], output, true)
-		if exit_code == 0 and output.size() > 0:
-			return _parse_windows_netstat_listening(str(output[0]), port)
+		_startup_trace_count("netstat")
 	else:
-		var exit_code := OS.execute("lsof", ["-ti:%d" % port, "-sTCP:LISTEN"], output, true)
-		return exit_code == 0 and output.size() > 0 and not output[0].strip_edges().is_empty()
-	return false
+		_startup_trace_count("lsof")
+	return PortResolver.is_port_in_use_via_scrape(port)
 
 
-## Return the PID currently listening on the given TCP port, or 0 if
-## the port is free. Netstat/lsof fallback; callers should prefer
-## `_find_managed_pid` which consults the Python-written pid-file first.
-##
-## Use when the pid-file is missing (pre-#154 server, or the server was
-## SIGKILL'd before writing it) to recover the port owner. On Windows
-## this parses `netstat -ano` line-by-line — Godot's `OS.execute` pushes
-## the whole stdout into `output[0]` as a single string, so an earlier
-## implementation that iterated `output` as if each element were a line
-## returned a garbage PID (the last whitespace-separated token in the
-## entire dump). See parser tests in tests/test_netstat_parser.gd.
+## Pass `_startup_trace_count` so the resolver bumps the right counter
+## per scraper that actually ran (Windows can fall through netstat →
+## PowerShell — counting both unconditionally would over-report).
 func _find_pid_on_port(port: int) -> int:
-	var output: Array = []
-	if OS.get_name() == "Windows":
-		var exit_code := OS.execute("netstat", ["-ano"], output, true)
-		if exit_code != 0 or output.is_empty():
-			return 0
-		return _parse_windows_netstat_pid(str(output[0]), port)
-	## POSIX: `lsof -ti:<port> -sTCP:LISTEN` returns only the PID, but can
-	## emit multiple (newline-separated) — e.g. a `uvicorn --reload` dev
-	## server has both a reloader parent and a worker child bound to the
-	## same port. Return the first valid pid so the kill path at least hits
-	## SOMEONE; `_find_all_pids_on_port` covers the full-sweep kill case.
-	var exit_code := OS.execute("lsof", ["-ti:%d" % port, "-sTCP:LISTEN"], output, true)
-	if exit_code != 0 or output.is_empty():
-		return 0
-	var pids := _parse_lsof_pids(str(output[0]))
-	return pids[0] if not pids.is_empty() else 0
+	return PortResolver.find_pid_on_port(port, _startup_trace_count)
 
 
-## POSIX-only sibling of `_find_pid_on_port` — returns every PID
-## bound LISTEN on `port`, so callers that need to tear down a process
-## group (e.g. `force_restart_server`) can reach both the reloader
-## parent and the worker. Windows netstat parser only ever returns one
-## LISTENER row per port so callers can skip this there.
 func _find_all_pids_on_port(port: int) -> Array[int]:
-	if OS.get_name() == "Windows":
-		var pids: Array[int] = []
-		var one := _find_pid_on_port(port)
-		if one > 0:
-			pids.append(one)
-		return pids
-	var output: Array = []
-	var exit_code := OS.execute("lsof", ["-ti:%d" % port, "-sTCP:LISTEN"], output, true)
-	if exit_code != 0 or output.is_empty():
-		var empty: Array[int] = []
-		return empty
-	return _parse_lsof_pids(str(output[0]))
+	return PortResolver.find_all_pids_on_port(port, _startup_trace_count)
 
 
-## Pure-parser for the `lsof -ti...` output shape: zero or more newline-
-## separated decimal PIDs. Extracted so tests can drive the dual-pid
-## (reloader parent + worker) case without spawning a real uvicorn.
+static func _execute_windows_powershell(script: String, output: Array) -> int:
+	return PortResolver.execute_windows_powershell(script, output)
+
+
+static func _windows_listener_pids_from_execute_result(exit_code: int, output: Array) -> Array[int]:
+	return PortResolver.windows_listener_pids_from_execute_result(exit_code, output)
+
+
+static func _windows_listener_execute_result_in_use(exit_code: int, output: Array) -> bool:
+	return PortResolver.windows_listener_execute_result_in_use(exit_code, output)
+
+
 static func _parse_lsof_pids(raw: String) -> Array[int]:
-	var pids: Array[int] = []
-	for line in raw.strip_edges().split("\n", false):
-		var stripped := line.strip_edges()
-		if stripped.is_valid_int():
-			pids.append(int(stripped))
-	return pids
+	return PortResolver.parse_lsof_pids(raw)
+
+
+static func _parse_pid_lines(raw: String) -> Array[int]:
+	return PortResolver.parse_pid_lines(raw)
 
 
 ## Find the managed server PID deterministically: prefer the pid-file
@@ -778,120 +1009,121 @@ func _find_managed_pid(port: int) -> int:
 	return _find_pid_on_port(port)
 
 
-## Parse the LISTENING line for `port` in a Windows `netstat -ano`
-## dump and return its PID, or 0 if no matching line is found.
-##
-## netstat prints rows like:
-##   TCP    0.0.0.0:8000    0.0.0.0:0    LISTENING    57865
-## (whitespace-separated, possibly with leading whitespace). Only rows
-## whose local address ends with `:<port>` AND state is `LISTENING`
-## qualify — substring-matching `:<port> ` against the whole dump was
-## the earlier bug; a remote address happening to include `:8000` would
-## false-positive.
+## `live` is the result of a prior `_probe_live_server_status_for_port`
+## call that the caller already has on hand. When non-empty it short-
+## circuits the internal probe at the bottom of this helper, so a single
+## `_start_server` invocation that probes once at the top can thread the
+## same snapshot through compatibility check + recovery without paying
+## for a second ~500 ms localhost HTTPClient poll loop. Default `{}`
+## preserves the historical behavior for callers outside the spawn flow
+## (`can_recover_incompatible_server`, the dock's UI buttons), where a
+## fresh probe is the right thing.
+func _evaluate_strong_port_occupant_proof(port: int, live: Dictionary = {}) -> Dictionary:
+	var result := {"proof": "", "pids": []}
+	var listener_pids := _find_all_pids_on_port(port)
+	if listener_pids.is_empty():
+		return result
+
+	var record := _read_managed_server_record()
+	var record_pid := int(record.get("pid", 0))
+	var record_version := str(record.get("version", ""))
+
+	if record_pid > 1 and record_pid != OS.get_process_id():
+		if listener_pids.has(record_pid) and _pid_alive_for_proof(record_pid):
+			return {"proof": "managed_record", "pids": [record_pid]}
+
+	var legacy_targets := _legacy_pidfile_kill_targets(port, listener_pids)
+	if not legacy_targets.is_empty():
+		return {"proof": "pidfile_listener", "pids": legacy_targets}
+
+	var current_live: Dictionary = live if not live.is_empty() else _probe_live_server_status_for_port(port)
+	if (
+		_live_status_identifies_godot_ai(current_live)
+		and not record_version.is_empty()
+		and str(current_live.get("version", "")) == record_version
+	):
+		return {"proof": "status_matches_record", "pids": listener_pids}
+
+	return result
+
+
+## See `_evaluate_strong_port_occupant_proof` for the `live` contract.
+## Threads `live` through the strong-proof delegate so neither helper
+## probes when the caller already knows the port-owner status.
+func _evaluate_recovery_port_occupant_proof(port: int, live: Dictionary = {}) -> Dictionary:
+	var proof := _evaluate_strong_port_occupant_proof(port, live)
+	if not str(proof.get("proof", "")).is_empty():
+		return proof
+
+	var current_live: Dictionary = live if not live.is_empty() else _probe_live_server_status_for_port(port)
+	if _live_status_identifies_godot_ai(current_live):
+		return {"proof": "status_name", "pids": _find_all_pids_on_port(port)}
+
+	return {"proof": "", "pids": []}
+
+
+func _recover_strong_port_occupant(port: int, wait_s: float, pre_kill_live: Dictionary = {}) -> bool:
+	return _lifecycle.recover_strong_port_occupant(port, wait_s, pre_kill_live)
+
+
+func _legacy_pidfile_kill_targets(_port: int, listener_pids: Array[int]) -> Array[int]:
+	var targets: Array[int] = []
+	var pidfile_pid := _read_pid_file_for_proof()
+	var pidfile_alive := _pid_alive_for_proof(pidfile_pid)
+	var pidfile_branded := _pid_cmdline_is_godot_ai_for_proof(pidfile_pid)
+	if pidfile_pid <= 1 or pidfile_pid == OS.get_process_id():
+		return targets
+	if not listener_pids.has(pidfile_pid) or not pidfile_alive:
+		return targets
+	if not pidfile_branded:
+		return targets
+
+	for pid in listener_pids:
+		if pid > 1 and pid != OS.get_process_id() and _pid_cmdline_is_godot_ai_for_proof(pid):
+			targets.append(pid)
+	return targets
+
+
+func _read_pid_file_for_proof() -> int:
+	return _read_pid_file()
+
+
+func _pid_alive_for_proof(pid: int) -> bool:
+	return _pid_alive(pid)
+
+
+func _pid_cmdline_is_godot_ai_for_proof(pid: int) -> bool:
+	return _pid_cmdline_is_godot_ai(pid)
+
+
 static func _parse_windows_netstat_pid(stdout: String, port: int) -> int:
-	var port_suffix := ":%d" % port
-	for line in stdout.split("\n"):
-		var s := line.strip_edges()
-		if s.is_empty():
-			continue
-		var fields := _split_on_whitespace(s)
-		## Minimum columns: proto, local, remote, state, pid
-		if fields.size() < 5:
-			continue
-		if fields[3] != "LISTENING":
-			continue
-		if not fields[1].ends_with(port_suffix):
-			continue
-		var pid_str := fields[fields.size() - 1]
-		if pid_str.is_valid_int():
-			return int(pid_str)
-	return 0
+	return PortResolver.parse_windows_netstat_pid(stdout, port)
 
 
-## True if any row in a Windows `netstat -ano` dump is a LISTENING
-## entry for `port`. See `_parse_windows_netstat_pid` for the row
-## schema and why substring-matching the whole dump is wrong.
+static func _parse_windows_netstat_pids(stdout: String, port: int) -> Array[int]:
+	return PortResolver.parse_windows_netstat_pids(stdout, port)
+
+
 static func _parse_windows_netstat_listening(stdout: String, port: int) -> bool:
-	return _parse_windows_netstat_pid(stdout, port) > 0
+	return PortResolver.parse_windows_netstat_listening(stdout, port)
 
 
 static func _split_on_whitespace(s: String) -> PackedStringArray:
-	## `String.split(" ", false)` only splits on single spaces; netstat
-	## columns are separated by runs of spaces (and sometimes tabs).
-	## Collapse whitespace manually so PID-column extraction is robust.
-	var out: PackedStringArray = []
-	var cur := ""
-	for i in s.length():
-		var c := s.substr(i, 1)
-		if c == " " or c == "\t":
-			if not cur.is_empty():
-				out.append(cur)
-				cur = ""
-		else:
-			cur += c
-	if not cur.is_empty():
-		out.append(cur)
-	return out
+	return PortResolver.split_on_whitespace(s)
 
 
-## Read the integer PID from SERVER_PID_FILE, or 0 if the file is
-## missing/empty/malformed. The file is written by the Python server
-## at startup (see --pid-file flag, plumbed in _start_server).
 static func _read_pid_file() -> int:
-	if not FileAccess.file_exists(SERVER_PID_FILE):
-		return 0
-	var f := FileAccess.open(SERVER_PID_FILE, FileAccess.READ)
-	if f == null:
-		return 0
-	var content := f.get_as_text().strip_edges()
-	f.close()
-	if content.is_empty() or not content.is_valid_int():
-		return 0
-	var pid := int(content)
-	return pid if pid > 0 else 0
+	return PortResolver.read_pid_file()
 
 
 static func _clear_pid_file() -> void:
-	if FileAccess.file_exists(SERVER_PID_FILE):
-		DirAccess.remove_absolute(ProjectSettings.globalize_path(SERVER_PID_FILE))
+	PortResolver.clear_pid_file()
 
 
 func _stop_server() -> void:
-	_stop_server_watch()
-	if _server_pid <= 0:
-		return
-	## Kill both the process we tracked and the real Python PID if they
-	## differ. For direct-spawn tiers (.venv, system CLI) these match
-	## and we kill once. For the uvx tier `_server_pid` is the launcher
-	## — may be dead (adopted), still installing, or done spawning; on
-	## Windows, `OS.kill` is `TerminateProcess` and does NOT walk the
-	## child tree, so without an independent read of the real PID the
-	## Python child survives and port 8000 stays held. `_find_managed_pid`
-	## reads the pid-file the server wrote at startup (deterministic),
-	## falling back to netstat/lsof if the file is missing.
-	var port := McpClientConfigurator.http_port()
-	var killed: Array[int] = []
-	if _pid_alive(_server_pid):
-		OS.kill(_server_pid)
-		killed.append(_server_pid)
-	var real_pid := _find_managed_pid(port)
-	if real_pid > 0 and not killed.has(real_pid):
-		OS.kill(real_pid)
-		killed.append(real_pid)
-	if not killed.is_empty():
-		print("MCP | stopped server (PID %s)" % str(killed))
-	_server_pid = -1
-	## Brief wait so a follow-up spawn doesn't race a still-closing socket.
-	_wait_for_port_free(port, 2.0)
-	## Only forget this server if the port is actually free. If the kill
-	## failed — e.g. a previous plugin version's buggy netstat parser
-	## targeted a bogus PID during the first v1.2.8 → v1.2.9 Update — then
-	## clearing the record would route the next _start_server down the
-	## "foreign server" branch, which leaves the zombie alone. Preserving
-	## the record keeps the next _start_server in the drift branch, which
-	## retries the kill with the current (fixed) parser. See issue filed
-	## as follow-up to PR #159.
-	_finalize_stop_if_port_free(port)
+	_lifecycle.stop_server()
+
+
 
 
 ## Clear the managed-server record and pid-file only if `port` is free.
@@ -921,11 +1153,140 @@ static func _build_server_flags(port: int, ws_port: int) -> Array[String]:
 	## least one domain to drop. Skipping the empty case keeps spawns
 	## compatible with older (pre-1.4.2) servers that don't know the flag —
 	## relevant during staggered plugin/server upgrades in user-mode installs.
-	var excluded := McpClientConfigurator.excluded_domains()
+	var excluded := ClientConfigurator.excluded_domains()
 	if not excluded.is_empty():
 		flags.append("--exclude-domains")
 		flags.append(excluded)
 	return flags
+
+
+## Returns true only when we can prove `pid`'s command line carries the
+## `godot-ai` brand AND a server flag (`--pid-file` / `--transport`). Used by
+## automatic kill paths (`_legacy_pidfile_kill_targets`) so a stale pidfile
+## whose PID has been recycled by an unrelated listener can't hand us a
+## kill target. If the OS lookup fails or returns an empty cmdline we
+## conservatively return false — better to surface incompatible-server and
+## let the user click Restart than to kill the wrong process.
+func _pid_cmdline_is_godot_ai(pid: int) -> bool:
+	## Walks up the parent chain so a uvicorn `--reload` worker whose
+	## cmdline is just `multiprocessing.spawn` still matches when its
+	## parent reloader carries the godot_ai brand. Bound the walk so a
+	## hypothetical loop or runaway PPID can't stall the editor.
+	var current := pid
+	for _i in range(5):
+		if current <= 1:
+			return false
+		var cmd := ""
+		if OS.get_name() == "Windows":
+			cmd = _windows_pid_commandline(current)
+		else:
+			cmd = _posix_pid_commandline(current)
+		if _commandline_is_godot_ai_server(cmd):
+			return true
+		current = _pid_parent(current)
+	return false
+
+
+func _pid_parent(pid: int) -> int:
+	if pid <= 1:
+		return 0
+	if OS.get_name() == "Windows":
+		var output: Array = []
+		var script := (
+			"Get-CimInstance Win32_Process -Filter 'ProcessId = %d' | "
+			+ "Select-Object -ExpandProperty ParentProcessId"
+		) % pid
+		_startup_trace_count("powershell")
+		if _execute_windows_powershell(script, output) != 0 or output.is_empty():
+			return 0
+		return int(str(output[0]).strip_edges())
+	var output_posix: Array = []
+	if OS.execute("ps", ["-o", "ppid=", "-p", str(pid)], output_posix, true) != 0 or output_posix.is_empty():
+		return 0
+	return int(str(output_posix[0]).strip_edges())
+
+
+static func _commandline_is_godot_ai_server(cmd: String) -> bool:
+	if cmd.is_empty():
+		return false
+	var lower := cmd.to_lower()
+	## The server is invoked with `--pid-file <user>/godot_ai_server.pid`,
+	## so the path itself contains "godot_ai". A naive substring brand
+	## search would falsely match an unrelated process whose cmdline
+	## happens to reference a similarly-named pidfile path. Strip the
+	## value (but leave the bare flag for the has_flag check) before
+	## brand matching.
+	var brand_search := _strip_pidfile_value(lower)
+	var has_brand := brand_search.find("godot-ai") >= 0 or brand_search.find("godot_ai") >= 0
+	var has_flag := lower.find("--pid-file") >= 0 or lower.find("--transport") >= 0
+	return has_brand and has_flag
+
+
+static func _strip_pidfile_value(cmd: String) -> String:
+	var rx := RegEx.new()
+	## Match `--pid-file=<token>` and `--pid-file <token>`; keep the bare
+	## flag so the flag-presence check still succeeds for a real server.
+	if rx.compile("--pid-file(?:=|\\s+)\\S+") != OK:
+		return cmd
+	return rx.sub(cmd, "--pid-file ", true)
+
+
+func _windows_pid_commandline(pid: int) -> String:
+	var output: Array = []
+	var script := (
+		"Get-CimInstance Win32_Process -Filter 'ProcessId = %d' | "
+		+ "Select-Object -ExpandProperty CommandLine"
+	) % pid
+	_startup_trace_count("powershell")
+	var exit_code := _execute_windows_powershell(script, output)
+	if exit_code != 0 or output.is_empty():
+		return ""
+	return str(output[0])
+
+
+## POSIX command-line lookup. Linux exposes `/proc/<pid>/cmdline` as
+## NUL-separated argv — read it directly so we avoid a `ps` fork on Linux
+## and get the full argv rather than the truncated/quoted form some `ps`
+## builds emit. Falls back to `ps -ww -p <pid> -o args=` on macOS / *BSD,
+## which lack a Linux-style `/proc/<pid>/cmdline`. Returns "" on failure
+## so callers conservatively reject the PID rather than killing it blind.
+func _posix_pid_commandline(pid: int) -> String:
+	var proc_path := "/proc/%d/cmdline" % pid
+	if FileAccess.file_exists(proc_path):
+		var f := FileAccess.open(proc_path, FileAccess.READ)
+		if f != null:
+			## procfs pseudo-files report length 0 (the kernel generates
+			## content on read). `get_length()` therefore returns 0 and
+			## `get_buffer(0)` reads nothing. Read in chunks until EOF
+			## instead. Cap at ARG_MAX-class bound so a hypothetically
+			## misbehaving file can never stall the editor frame.
+			var bytes := PackedByteArray()
+			var max_bytes := 1 << 20  # 1 MiB
+			while bytes.size() < max_bytes:
+				var chunk := f.get_buffer(4096)
+				if chunk.is_empty():
+					break
+				bytes.append_array(chunk)
+				if f.eof_reached():
+					break
+			f.close()
+			## /proc cmdline is NUL-separated argv; convert NULs to spaces
+			## so the substring fingerprint matches the same way it does on
+			## the Windows path. Empty (kernel threads, exited processes)
+			## bubbles up as "" via the strip below.
+			for i in range(bytes.size()):
+				if bytes[i] == 0:
+					bytes[i] = 0x20
+			return bytes.get_string_from_utf8().strip_edges()
+	## `-ww` removes ps's column-width truncation so trailing flags like
+	## --pid-file / --transport aren't dropped from the args= field.
+	## Both procps (Linux) and BSD ps (macOS / *BSD) accept the
+	## double-w form.
+	var output: Array = []
+	var exit_code := OS.execute("ps", ["-ww", "-p", str(pid), "-o", "args="], output, true)
+	if exit_code != 0 or output.is_empty():
+		return ""
+	return str(output[0]).strip_edges()
 
 
 ## True if the given PID corresponds to a live (non-zombie) process.
@@ -934,39 +1295,11 @@ static func _build_server_flags(port: int, ws_port: int) -> Array[String]:
 ## managed server that outlived its editor from a stale EditorSettings
 ## record, and by `_check_server_health` to detect a fast-failing launcher.
 static func _pid_alive(pid: int) -> bool:
-	if pid <= 0:
-		return false
-	if OS.get_name() == "Windows":
-		var output: Array = []
-		var exit_code := OS.execute("tasklist", ["/FI", "PID eq %d" % pid, "/NH", "/FO", "CSV"], output, true)
-		if exit_code != 0 or output.is_empty():
-			return false
-		## tasklist returns "INFO: No tasks ..." when the PID doesn't exist,
-		## otherwise a CSV row containing the PID. Match on the PID appearing
-		## as its own field rather than INFO-string substring.
-		for line in output:
-			if str(line).find("\"%d\"" % pid) >= 0:
-				return true
-		return false
-	## `kill -0` returns 0 for BOTH running and zombie processes, and Godot
-	## never `waitpid`s on `OS.create_process` children — so an `uvx` launcher
-	## that fails-fast (~40ms for "no solution" on a bogus version, or a stale
-	## PyPI index) lingers as a zombie forever. `kill -0` would report it as
-	## alive, blocking the spawn-failure branch in `_check_server_health` from
-	## ever firing. Ask `ps` for the actual process state instead. State column
-	## codes on Darwin/Linux: running/sleeping (R/S/D/I/T), zombie (Z),
-	## unknown-but-exited (empty output / non-zero exit). See #172.
-	var output: Array = []
-	var exit_code := OS.execute("ps", ["-p", str(pid), "-o", "stat="], output, true)
-	if exit_code != 0 or output.is_empty():
-		return false
-	var stat := str(output[0]).strip_edges()
-	return not stat.is_empty() and not stat.begins_with("Z")
+	return PortResolver.pid_alive(pid)
 
 
-## Poll until the given port is no longer bound, or the timeout elapses.
-## Used after `OS.kill` in the update-flow restart branch so we don't race
-## the port-in-use check when we try to rebind.
+## Calls `_is_port_in_use` (not `PortResolver.wait_for_port_free`) so
+## `_ProofPlugin` overrides keep driving the loop.
 func _wait_for_port_free(port: int, timeout_s: float) -> void:
 	var deadline := Time.get_ticks_msec() + int(timeout_s * 1000.0)
 	while _is_port_in_use(port):
@@ -979,14 +1312,17 @@ func _wait_for_port_free(port: int, timeout_s: float) -> void:
 func _read_managed_server_record() -> Dictionary:
 	var es := EditorInterface.get_editor_settings()
 	if es == null:
-		return {"pid": 0, "version": ""}
+		return {"pid": 0, "version": "", "ws_port": 0}
 	var pid: int = 0
 	if es.has_setting(MANAGED_SERVER_PID_SETTING):
 		pid = int(es.get_setting(MANAGED_SERVER_PID_SETTING))
 	var version: String = ""
 	if es.has_setting(MANAGED_SERVER_VERSION_SETTING):
 		version = str(es.get_setting(MANAGED_SERVER_VERSION_SETTING))
-	return {"pid": pid, "version": version}
+	var ws_port: int = 0
+	if es.has_setting(MANAGED_SERVER_WS_PORT_SETTING):
+		ws_port = int(es.get_setting(MANAGED_SERVER_WS_PORT_SETTING))
+	return {"pid": pid, "version": version, "ws_port": ws_port}
 
 
 func _write_managed_server_record(pid: int, version: String) -> void:
@@ -995,6 +1331,7 @@ func _write_managed_server_record(pid: int, version: String) -> void:
 		return
 	es.set_setting(MANAGED_SERVER_PID_SETTING, pid)
 	es.set_setting(MANAGED_SERVER_VERSION_SETTING, version)
+	es.set_setting(MANAGED_SERVER_WS_PORT_SETTING, _resolved_ws_port)
 
 
 func _clear_managed_server_record() -> void:
@@ -1005,42 +1342,128 @@ func _clear_managed_server_record() -> void:
 		es.set_setting(MANAGED_SERVER_PID_SETTING, 0)
 	if es.has_setting(MANAGED_SERVER_VERSION_SETTING):
 		es.set_setting(MANAGED_SERVER_VERSION_SETTING, "")
+	if es.has_setting(MANAGED_SERVER_WS_PORT_SETTING):
+		es.set_setting(MANAGED_SERVER_WS_PORT_SETTING, 0)
 
 
-## Prepare for a plugin-self-update reload cycle: kill the server process
-## and reset the re-entrancy guard so the re-enabled plugin spawns a fresh
-## server. Without the reset, `_start_server` short-circuits on the static
-## flag after the reload — even though we just freed the port — and the
-## new plugin ends up talking to whatever process inherited port 8000
-## (or, if none exists, the server never starts at all). See #132.
 func prepare_for_update_reload() -> void:
-	_stop_server()
-	_server_started_this_session = false
+	_lifecycle.prepare_for_update_reload()
+
+
+func _adopt_compatible_server(record_version: String, current_version: String, owner: int) -> String:
+	return _lifecycle.adopt_compatible_server(record_version, current_version, owner)
+
+
+static func _compatible_adoption_log_message(
+	owner_label: String,
+	owned_pid: int,
+	observed_owner_pid: int,
+	live_version: String,
+	live_ws_port: int,
+	current_version: String
+) -> String:
+	if owner_label == "managed":
+		return "MCP | adopted managed server (PID %d, live v%s, WS %d, plugin v%s)" % [
+			owned_pid,
+			live_version,
+			live_ws_port,
+			current_version
+		]
+	return "MCP | adopted external server owner_pid=%d (live v%s, WS %d, plugin v%s)" % [
+		observed_owner_pid,
+		live_version,
+		live_ws_port,
+		current_version
+	]
+
+
+## Hand the self-update over to a tiny runner that is not owned by this
+## EditorPlugin. The runner keeps the editor process alive, but disables this
+## plugin before extracting/scanning the new scripts so every plugin-owned
+## instance tears down on pre-update bytecode and pre-update field storage.
+func install_downloaded_update(zip_path: String, temp_dir: String, source_dock: Control) -> void:
+	prepare_for_update_reload()
+
+	var detached_dock = null
+	if _dock != null and is_instance_valid(_dock):
+		detached_dock = _dock
+		remove_control_from_docks(_dock)
+		_dock = null
+	elif source_dock != null and is_instance_valid(source_dock):
+		detached_dock = source_dock
+		remove_control_from_docks(source_dock)
+
+	var runner = UPDATE_RELOAD_RUNNER_SCRIPT.new()
+	var parent: Node = EditorInterface.get_base_control()
+	if parent == null:
+		parent = get_tree().root
+	parent.add_child(runner)
+	runner.start(zip_path, temp_dir, detached_dock)
+
+
+func can_recover_incompatible_server() -> bool:
+	return _lifecycle.can_recover_incompatible_server()
+
+
+func _resume_connection_after_recovery() -> void:
+	if _connection == null:
+		return
+	var state: int = _lifecycle.get_state()
+	if (
+		_lifecycle.is_connection_blocked()
+		or (
+			state != ServerStateScript.SPAWNING
+			and state != ServerStateScript.READY
+		)
+	):
+		return
+	_connection.connect_blocked = false
+	_connection.connect_block_reason = ""
+	_connection.server_version = ""
+	_connection.set_process(true)
+	_arm_server_version_check()
+
+
+func recover_incompatible_server() -> bool:
+	if not _lifecycle.recover_incompatible_server():
+		return false
+	_resume_connection_after_recovery()
+	return true
 
 
 ## Kill whichever process is holding `http_port()` right now — by resolving
 ## the port-owning PID via pid-file / netstat / lsof, independent of whether
-## we ever set `_server_pid` — then clear ownership state and respawn via
-## `_start_server`. The dock's version-mismatch banner wires here when the
-## plugin adopted a foreign server (no managed record, `_server_pid == -1`)
-## whose `server_version` drifts from the current plugin version. Without
-## this, `_stop_server` early-returns on `_server_pid <= 0` and the old
-## server outlives every plugin reload.
+## we ever set the manager's `_server_pid` — then clear ownership state
+## and respawn via the lifecycle manager. The dock's version-mismatch
+## banner wires here when the plugin adopted a foreign server whose
+## `server_version` drifts from the current plugin version.
 func force_restart_server() -> void:
-	var port := McpClientConfigurator.http_port()
-	## Kill every LISTENER on the port, not just the first one. A dev
-	## server run via `uvicorn --reload` owns port 8000 through both a
-	## reloader parent AND a worker child — killing only one (or zero,
-	## if the single-pid parse fell over on multi-line lsof output) leaves
-	## the other holding the port past `_wait_for_port_free`'s window.
-	for pid in _find_all_pids_on_port(port):
-		OS.kill(pid)
-	_clear_managed_server_record()
-	_clear_pid_file()
-	_wait_for_port_free(port, 5.0)
-	_server_started_this_session = false
-	_server_pid = -1
-	_start_server()
+	_lifecycle.force_restart_server()
+
+
+## Single entry point for the dock's primary "Restart Dev Server" button.
+## The user clicking Restart is explicit consent to take over the HTTP port,
+## so this is aggressive: any PID holding the port gets killed (managed,
+## branded-dev, or orphan multiprocessing.spawn workers whose parent died
+## so brand detection misses them). After the port frees we spawn a fresh
+## --reload dev server. Returns true if a kill happened, false if the port
+## was already free and we just spawned.
+func force_restart_or_start_dev_server() -> bool:
+	var port := ClientConfigurator.http_port()
+	var killed := false
+	if has_managed_server():
+		_lifecycle.reset_for_force_restart()
+	if _is_port_in_use(port):
+		_kill_processes_and_windows_spawn_children(_find_all_pids_on_port(port))
+		killed = true
+	if killed:
+		## OS.kill returns synchronously but uvicorn's listener can take
+		## longer to release the port. Without this wait, start_dev_server's
+		## fixed 500ms timer races the old shutdown and the new --reload
+		## spawn fails to bind.
+		_wait_for_port_free(port, 5.0)
+	start_dev_server()
+	return killed
 
 
 func start_dev_server() -> void:
@@ -1056,22 +1479,23 @@ func start_dev_server() -> void:
 	## worktree's Python. See #84.
 	_stop_server()
 	get_tree().create_timer(0.5).timeout.connect(func():
-		var server_cmd := McpClientConfigurator.get_server_command()
+		var server_cmd := ClientConfigurator.get_server_command()
 		if server_cmd.is_empty():
 			push_warning("MCP | could not find server command for dev server")
 			return
 
 		var cmd: String = server_cmd[0]
+		_set_resolved_ws_port(_resolve_ws_port())
 		var inner_args: Array[String] = []
 		inner_args.assign(server_cmd.slice(1))
 		inner_args.append_array([
 			"--transport", "streamable-http",
-			"--port", str(McpClientConfigurator.http_port()),
-			"--ws-port", str(McpClientConfigurator.ws_port()),
+			"--port", str(ClientConfigurator.http_port()),
+			"--ws-port", str(_resolved_ws_port),
 			"--reload",
 		])
 
-		var worktree_src := McpClientConfigurator.find_worktree_src_dir(ProjectSettings.globalize_path("res://"))
+		var worktree_src := ClientConfigurator.find_worktree_src_dir(ProjectSettings.globalize_path("res://"))
 		var prev_pythonpath := OS.get_environment("PYTHONPATH")
 		if not worktree_src.is_empty():
 			var sep := ";" if OS.get_name() == "Windows" else ":"
@@ -1101,28 +1525,83 @@ func start_dev_server() -> void:
 func stop_dev_server() -> void:
 	## Stop any server running on the HTTP port (by port, not PID).
 	## Used for dev servers whose PID we don't track across reloads.
-	if _server_pid > 0:
+	if _lifecycle.get_server_pid() > 0:
 		# We have a managed server — use normal stop
 		_stop_server()
 		return
-	var output: Array = []
-	var port := McpClientConfigurator.http_port()
+	var port := ClientConfigurator.http_port()
+	var candidates: Array[int] = []
+	for pid in _find_all_pids_on_port(port):
+		var candidate := int(pid)
+		if _pid_cmdline_is_godot_ai(candidate):
+			candidates.append(candidate)
+	var killed := _kill_processes_and_windows_spawn_children(candidates)
+	if not killed.is_empty():
+		print("MCP | stopped dev server on port %d" % port)
+
+
+func _kill_processes_and_windows_spawn_children(pids: Array[int]) -> Array[int]:
+	var unique: Array[int] = []
+	for pid in pids:
+		if pid > 0 and not unique.has(pid):
+			unique.append(pid)
 	if OS.get_name() == "Windows":
-		# Find PID listening on port, then kill
-		var exit_code := OS.execute("cmd", ["/c", "for /f \"tokens=5\" %%a in ('netstat -ano ^| findstr :%d ^| findstr LISTENING') do taskkill /PID %%a /F" % port], output, true)
-		if exit_code == 0:
-			print("MCP | stopped dev server on port %d" % port)
-	else:
-		var exit_code := OS.execute("bash", ["-c", "lsof -ti:%d -sTCP:LISTEN | xargs kill 2>/dev/null" % port], output, true)
-		if exit_code == 0:
-			print("MCP | stopped dev server on port %d" % port)
+		for child_pid in _find_windows_spawn_children(unique):
+			if not unique.has(child_pid):
+				unique.append(child_pid)
+	var killed: Array[int] = []
+	for pid in unique:
+		if OS.get_name() == "Windows":
+			var output: Array = []
+			var exit_code := OS.execute("taskkill", ["/PID", str(pid), "/T", "/F"], output, true)
+			if exit_code == 0 or not _pid_alive(pid):
+				killed.append(pid)
+		else:
+			OS.kill(pid)
+			killed.append(pid)
+	return killed
+
+
+func _find_windows_spawn_children(parent_pids: Array[int]) -> Array[int]:
+	if parent_pids.is_empty():
+		var empty: Array[int] = []
+		return empty
+	var found: Array[int] = []
+	for parent_pid in parent_pids:
+		var output: Array = []
+		var script := (
+			"Get-CimInstance Win32_Process | "
+			+ "Where-Object { $_.CommandLine -like '*spawn_main(parent_pid=%d*' } | "
+			+ "ForEach-Object { $_.ProcessId }"
+		) % parent_pid
+		_startup_trace_count("powershell")
+		var exit_code := _execute_windows_powershell(script, output)
+		if exit_code != 0 or output.is_empty():
+			continue
+		for pid in _parse_pid_lines(str(output[0])):
+			if not found.has(pid):
+				found.append(pid)
+	return found
 
 
 func is_dev_server_running() -> bool:
-	## Returns true if a server is running on the HTTP port that we didn't start as managed.
-	return _server_pid <= 0 and _is_port_in_use(McpClientConfigurator.http_port())
+	## Returns true if a branded dev server is running on the HTTP port
+	## that we didn't start as managed.
+	if _lifecycle.get_server_pid() > 0:
+		return false
+	for pid in _find_all_pids_on_port(ClientConfigurator.http_port()):
+		if _pid_cmdline_is_godot_ai(int(pid)):
+			return true
+	return false
 
 
 func has_managed_server() -> bool:
 	## Returns true if the plugin is currently managing a server process it spawned.
-	return _server_pid > 0
+	return _lifecycle.has_managed_server()
+
+
+func can_restart_managed_server() -> bool:
+	## Restart is allowed only when we have ownership proof. A live PID
+	## means this plugin spawned/adopted a managed server; a non-empty
+	## managed record is the cross-session proof used by the drift branch.
+	return _lifecycle.can_restart_managed_server()

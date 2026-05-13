@@ -6,17 +6,16 @@ extends Node2D
 ## Performance architecture for 10,000 agents:
 ##   - Agent state stored in flat PackedArrays (positions, velocities) — no per-Node overhead.
 ##   - Single MultiMeshInstance2D draws all agents in ONE draw call.
-##   - Render buffer updated via RenderingServer.multimesh_set_buffer → one GPU upload/frame
-##     regardless of agent count (vs. N individual set_instance_transform_2d calls).
+##   - Render buffer updated via set_instance_transform_2d each frame;
+##     reads directly from positions[] so it stays in sync with particle/indicator draws.
 ##   - Flow field sampled per agent: O(1) bilinear lookup.
 ##   - Total per-frame work: O(agent_count) loop + 1 GPU upload.
 ##
 ## Memory estimate at 10,000 agents:
 ##   positions  : 10k × 8  bytes = ~80 KB
 ##   velocities : 10k × 8  bytes = ~80 KB
-##   render buf : 10k × 32 bytes = ~320 KB  (Transform2D = 8 floats × 4 bytes)
 ##   flow field : 64×64 × 12 bytes ≈ 48 KB
-##   Total      : < 600 KB
+##   Total      : < 250 KB
 
 const CELL_SIZE:   int   = 16
 const WORLD_W:     int   = 64
@@ -44,6 +43,14 @@ const DEFAULT_WATCHTOWER_RADIUS: int = 7
 @export_range(0.5, 10.0, 0.1) var settle_radius_tiles: float = 3.0
 ## Blend range around settle radius in tiles.
 @export_range(0.1, 5.0, 0.1) var settle_band_tiles: float = 1.0
+## Max cached flow fields keyed by target tile + walkability revision.
+@export_range(8, 256, 8) var flow_cache_capacity: int = 64
+## Delay before recomputing flow after rapid retargeting.
+@export_range(0.0, 0.5, 0.01) var flow_recompute_debounce_sec: float = 0.03
+## Skip drawing agents outside active camera bounds while still simulating them.
+@export var cull_offscreen_render: bool = true
+## Extra margin around the camera rectangle so pop-in is less noticeable.
+@export_range(0.0, 512.0, 1.0) var render_cull_margin_px: float = 96.0
 
 ## Read-only: flat arrays of agent state (public for external systems to read).
 var positions:  PackedVector2Array
@@ -66,11 +73,15 @@ var _watchtower_radius: int = DEFAULT_WATCHTOWER_RADIUS
 var _auto_watchtower_enabled: bool = false
 var _max_watchtowers: int = 12
 var _watchtowers: Array[Vector2i] = []
+var _flow_dirty: bool = false
+var _pending_flow_target_world: Vector2 = Vector2.ZERO
+var _flow_recompute_cooldown: float = 0.0
+var _last_flow_target_cell: Vector2i = Vector2i(-9999, -9999)
+var _render_bounds_enabled: bool = false
+var _render_bounds_min: Vector2 = Vector2.ZERO
+var _render_bounds_max: Vector2 = Vector2.ZERO
 
-## Pre-allocated GPU upload buffer.
-## Layout per instance (TRANSFORM_2D, no per-instance color):
-##   [x.x, x.y, y.x, y.y, origin.x, origin.y, pad, pad]  = 8 floats = 32 bytes
-var _buf: PackedFloat32Array
+
 
 
 func _ready() -> void:
@@ -86,6 +97,7 @@ func _ready() -> void:
 	# Default target: world centre
 	_target_world = Vector2(WORLD_W * CELL_SIZE * 0.5, WORLD_H * CELL_SIZE * 0.5)
 	_flow.compute(_target_world, _walkable)
+	_last_flow_target_cell = _world_to_cell(_target_world)
 
 
 ## ─── World ────────────────────────────────────────────────────────────────────
@@ -93,6 +105,7 @@ func _ready() -> void:
 func _build_world() -> void:
 	_flow = FlowField.new()
 	_flow.setup(WORLD_W, WORLD_H, CELL_SIZE)
+	_flow.set_cache_capacity(flow_cache_capacity)
 	_tile_counts = PackedInt32Array()
 	_tile_counts.resize(WORLD_W * WORLD_H)
 	_render_tile_counts = PackedInt32Array()
@@ -124,6 +137,7 @@ func _build_world() -> void:
 	# Start with one small landmark watchtower in the initial area.
 	_watchtowers.clear()
 	_add_watchtower_tile(Vector2i(cx, cy))
+	_flow.notify_walkable_changed()
 
 
 func _build_slot_offsets() -> void:
@@ -158,6 +172,7 @@ func _build_multimesh() -> void:
 	mm.use_custom_data  = false
 	mm.mesh             = mesh
 	mm.instance_count   = agent_count
+	mm.visible_instance_count = agent_count
 
 	_mmi            = MultiMeshInstance2D.new()
 	_mmi.multimesh  = mm
@@ -178,9 +193,6 @@ func _spawn_agents() -> void:
 	_noise_rate.resize(agent_count)
 	_visual_dir.resize(agent_count)
 	_tile_counts.fill(0)
-
-	# 8 floats per instance; pre-init transform columns to identity
-	_buf.resize(agent_count * 8)
 
 	var rng := RandomNumberGenerator.new()
 	rng.randomize()
@@ -219,12 +231,7 @@ func _spawn_agents() -> void:
 		_visual_dir[i] = Vector2(cos(jitter_angle), sin(jitter_angle))
 		_mmi.multimesh.set_instance_transform_2d(i, Transform2D(0.0, pos))
 
-		# Keep buffer initialized for future bulk-upload optimization.
-		var b: int = i * 8
-		_buf[b]     = 1.0;    _buf[b + 1] = 0.0
-		_buf[b + 2] = 0.0;    _buf[b + 3] = 1.0
-		_buf[b + 4] = pos.x;  _buf[b + 5] = pos.y
-		_buf[b + 6] = 0.0;    _buf[b + 7] = 0.0
+		# Buffer is fully refreshed in _flush_render each frame.
 
 
 ## ─── Per-frame ───────────────────────────────────────────────────────────────
@@ -234,6 +241,11 @@ func _process(delta: float) -> void:
 		_step_infinite(delta)
 		_flush_render_infinite()
 		return
+
+	if _flow_dirty:
+		_flow_recompute_cooldown = maxf(0.0, _flow_recompute_cooldown - delta)
+		if _flow_recompute_cooldown <= 0.0:
+			_apply_pending_flow_target()
 
 	_step(delta)
 	_flush_render()
@@ -290,16 +302,20 @@ func _step(delta: float) -> void:
 	_tile_counts = next_counts
 
 
-## Single GPU upload replaces N individual set_instance_transform_2d calls.
-## Only origin (position) changes each frame; rotation columns stay identity.
 func _flush_render() -> void:
 	_render_tile_counts.fill(0)
+	var write_i: int = 0
 	for i in agent_count:
 		var idx: int = _cell_index_from_world(positions[i])
 		var slot: int = mini(_render_tile_counts[idx], TILE_CAPACITY - 1)
 		_render_tile_counts[idx] += 1
 		var draw_pos: Vector2 = positions[i] + _slot_offsets[slot] + _visual_dir[i] * visual_jitter_px
-		_mmi.multimesh.set_instance_transform_2d(i, Transform2D(0.0, draw_pos))
+		if cull_offscreen_render and _render_bounds_enabled:
+			if draw_pos.x < _render_bounds_min.x or draw_pos.x > _render_bounds_max.x or draw_pos.y < _render_bounds_min.y or draw_pos.y > _render_bounds_max.y:
+				continue
+		_mmi.multimesh.set_instance_transform_2d(write_i, Transform2D(0.0, draw_pos))
+		write_i += 1
+	_mmi.multimesh.visible_instance_count = write_i
 
 
 ## ─── Public API ──────────────────────────────────────────────────────────────
@@ -313,7 +329,9 @@ func set_target(world_pos: Vector2) -> void:
 			for i in agent_count:
 				_agent_targets[i] = world_pos
 		return
-	_flow.compute(world_pos, _walkable)
+	_pending_flow_target_world = world_pos
+	_flow_dirty = true
+	_flow_recompute_cooldown = flow_recompute_debounce_sec
 	if _auto_watchtower_enabled:
 		place_watchtower(world_pos)
 
@@ -352,6 +370,7 @@ func add_agents(count: int, spawn_center: Vector2 = Vector2.ZERO) -> void:
 	_visual_dir.resize(agent_count)
 	_agent_targets.resize(agent_count)
 	_mmi.multimesh.instance_count = agent_count
+	_mmi.multimesh.visible_instance_count = agent_count
 
 	var rng := RandomNumberGenerator.new()
 	rng.randomize()
@@ -479,7 +498,6 @@ func _spawn_agents_infinite() -> void:
 	_noise_phase.resize(agent_count)
 	_noise_rate.resize(agent_count)
 	_visual_dir.resize(agent_count)
-
 	var rng := RandomNumberGenerator.new()
 	rng.randomize()
 
@@ -496,6 +514,7 @@ func _spawn_agents_infinite() -> void:
 		var jitter_angle: float = rng.randf() * TAU
 		_visual_dir[i] = Vector2(cos(jitter_angle), sin(jitter_angle))
 		_mmi.multimesh.set_instance_transform_2d(i, Transform2D(0.0, pos))
+	_mmi.multimesh.visible_instance_count = agent_count
 
 
 func _step_infinite(delta: float) -> void:
@@ -523,6 +542,38 @@ func _step_infinite(delta: float) -> void:
 
 
 func _flush_render_infinite() -> void:
+	var write_i: int = 0
 	for i in agent_count:
 		var draw_pos: Vector2 = positions[i] + _visual_dir[i] * visual_jitter_px
-		_mmi.multimesh.set_instance_transform_2d(i, Transform2D(0.0, draw_pos))
+		if cull_offscreen_render and _render_bounds_enabled:
+			if draw_pos.x < _render_bounds_min.x or draw_pos.x > _render_bounds_max.x or draw_pos.y < _render_bounds_min.y or draw_pos.y > _render_bounds_max.y:
+				continue
+		_mmi.multimesh.set_instance_transform_2d(write_i, Transform2D(0.0, draw_pos))
+		write_i += 1
+	_mmi.multimesh.visible_instance_count = write_i
+
+
+func set_render_bounds(view_min: Vector2, view_max: Vector2) -> void:
+	_render_bounds_enabled = true
+	_render_bounds_min = view_min - Vector2.ONE * render_cull_margin_px
+	_render_bounds_max = view_max + Vector2.ONE * render_cull_margin_px
+
+
+func clear_render_bounds() -> void:
+	_render_bounds_enabled = false
+
+
+func _apply_pending_flow_target() -> void:
+	_flow_dirty = false
+	var target_cell: Vector2i = _world_to_cell(_pending_flow_target_world)
+	if target_cell == _last_flow_target_cell:
+		return
+	_last_flow_target_cell = target_cell
+	_flow.compute(_pending_flow_target_world, _walkable)
+
+
+func _world_to_cell(world_pos: Vector2) -> Vector2i:
+	return Vector2i(
+		clampi(int(world_pos.x / CELL_SIZE), 0, WORLD_W - 1),
+		clampi(int(world_pos.y / CELL_SIZE), 0, WORLD_H - 1)
+	)

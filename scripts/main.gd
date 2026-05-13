@@ -32,6 +32,9 @@ const TOOL_HAND: int = 0
 const TOOL_AXE: int = 1
 const TOOL_PICK: int = 2
 const TOOL_SCYTHE: int = 3
+const THINK_EXECUTING: int = 0
+const THINK_THINKING: int = 1
+const THINK_BLOCKED: int = 2
 
 const UI_BG := Color(0.06, 0.09, 0.12, 0.94)
 const UI_BG_ALT := Color(0.1, 0.14, 0.18, 0.94)
@@ -51,7 +54,41 @@ const SETTLER_NAMES: PackedStringArray = [
 
 @onready var _agents: AgentSystem = $AgentSystem
 @onready var _label: Label = $UI/Label
+@onready var _ui_layer: CanvasLayer = $UI
 @onready var _camera: Camera2D = $Camera2D
+
+const WEAPON_EDITOR_SCENE: PackedScene = preload("res://scenes/weapon_editor/weapon_editor.tscn")
+
+@export var run_10k_settler_stress_test: bool = true
+@export_range(1000, 50000, 500) var stress_test_settler_target: int = 400
+@export var enable_global_settler_log: bool = true
+@export var global_settler_log_path: String = "user://settler_global_log.csv"
+@export_range(0.1, 10.0, 0.1) var global_settler_log_flush_sec: float = 0.5
+@export_range(1.0, 60.0, 0.5) var global_settler_snapshot_sec: float = 5.0
+@export_range(1000, 200000, 1000) var global_settler_log_max_buffered_lines: int = 30000
+@export var show_performance_debug_panel: bool = true
+@export_range(0.1, 2.0, 0.05) var performance_debug_refresh_sec: float = 0.25
+@export_range(0.1, 5.0, 0.1) var minimap_update_interval_sec: float = 1.0
+@export_range(0.1, 5.0, 0.1) var fog_reveal_update_interval_sec: float = 1.0
+@export_range(0.1, 3.0, 0.05) var settler_idle_think_interval_sec: float = 0.75
+@export_range(0.2, 5.0, 0.05) var settler_active_think_interval_sec: float = 2.0
+@export_range(0.0, 1.0, 0.01) var settler_think_jitter_sec: float = 0.2
+@export var show_settler_thinking_indicator: bool = true
+@export_range(2.0, 32.0, 1.0) var settler_arrival_rethink_distance_px: float = 10.0
+@export_range(0.1, 5.0, 0.1) var settler_stuck_rethink_sec: float = 1.0
+@export_range(0.01, 4.0, 0.01) var settler_min_progress_px: float = 0.2
+@export_range(10, 2000, 10) var settler_decision_budget_per_tick: int = 120
+@export var offscreen_decision_throttle_enabled: bool = true
+@export_range(1, 16, 1) var offscreen_decision_stride: int = 4
+@export_range(1, 16, 1) var offscreen_night_planning_stride: int = 2
+@export_range(0.0, 12.0, 0.1) var morning_dispatch_spread_sec: float = 4.0
+@export_range(1.0, 25.0, 0.25) var resource_node_yield_mult: float = 6.0
+@export_range(1, 1000, 1) var night_planning_budget_per_tick: int = 120
+@export_range(2, 32, 1) var settler_route_segment_tiles: int = 10
+@export_range(8, 64, 4) var world_chunk_tiles: int = 24
+@export_range(64, 4096, 64) var world_chunk_cache_max_entries: int = 768
+@export_range(1, 32, 1) var world_chunk_rebuild_budget_per_frame: int = 3
+@export_range(0.1, 5.0, 0.1) var world_chunk_prune_interval_sec: float = 0.5
 
 var _target: Vector2 = Vector2.ZERO
 var _world_seed: int = 912713
@@ -64,7 +101,9 @@ var _watchtowers: Array[Vector2i] = []
 var _explored: Dictionary = {}
 
 var _resource_remaining: Dictionary = {}
+var _berry_overnight_regrow_due: Dictionary = {}  # tile_key -> seconds until full overnight regrow
 var _harvest_tick: float = 0.0
+var _resource_regrow_tick: float = 0.0
 var _ai_tick: float = 0.0
 var _cook_tick: float = 0.0  # cooking accumulator (ticks every 4s per housed settler)
 var _tree_yield_mult: float = 1.0
@@ -186,8 +225,10 @@ var _upgrade_category_btns: Dictionary = {}   # cat_name -> Button
 var _upgrade_content_col: VBoxContainer       # replaced on category switch
 var _upgrade_content_scroll: ScrollContainer  # right-side scroll
 var _active_category: String = ""
+var _debug_panel_toggle_btn: Button
 
 var _resource_labels: Dictionary = {}
+var _resource_job_labels: Dictionary = {}
 var _building_labels: Dictionary = {}
 var _status_label: Label
 var _workshop_toggle_btn: Button
@@ -201,7 +242,11 @@ var _hover_title_label: Label
 var _hover_body_label: RichTextLabel
 var _agent_recent_actions: Dictionary = {}
 var _agent_last_state: Dictionary = {}
+var _resource_mgr: ResourceManager = ResourceManager.new()
 var _settler_resource_targets: Dictionary = {}  # index -> Vector2i, cached resource tile
+var _resource_claims: Dictionary = {}  # tile_key -> settler index
+var _settler_day_plan_targets: Dictionary = {}  # index -> Vector2i planned destination for next day
+var _settler_day_plan_job: Dictionary = {}      # index -> int job id used when plan was created
 var _settler_job_overrides: Dictionary = {}  # index -> int, per-settler job override
 var _settler_names: Array[String] = []  # index -> name
 var _job_btn_row: HBoxContainer
@@ -227,10 +272,22 @@ var _minimap_image: Image
 var _minimap_accum: float = 0.0
 var _fog_reveal_accum: float = 0.0
 var _minimap_scale: float = 2.6
+var _world_chunk_textures: Dictionary = {}   # chunk_key -> ImageTexture
+var _world_chunk_dirty: Dictionary = {}      # chunk_key -> bool
+var _world_chunk_last_used: Dictionary = {}  # chunk_key -> frame
+var _world_chunk_rebuild_queue: Array[Vector2i] = []
+var _world_chunk_rebuild_queued: Dictionary = {}
+var _world_chunk_prune_accum: float = 0.0
+var _resource_type_cache: Dictionary = {}
+var _resource_initial_amount_cache: Dictionary = {}
 
 var _upgrade_bursts: Array[Dictionary] = []
 var _floating_texts: Array[Dictionary] = []
 var _collect_particles: Array[Dictionary] = []
+var _collect_particle_texture: Texture2D
+var _collect_particle_mesh: QuadMesh
+var _collect_particle_multimesh: MultiMesh = MultiMesh.new()
+var _collect_particle_batch_ready: bool = false
 var _camera_base_pos: Vector2
 var _camera_kick: Vector2 = Vector2.ZERO
 var _rng := RandomNumberGenerator.new()
@@ -242,6 +299,11 @@ var _food_consume_mult: float = 1.0
 var _food_consume_tick: float = 0.0
 var _food_gather_mult: float = 1.0
 var _storehouse_mult: float = 1.0
+var _settler_mgr: SettlerManager = SettlerManager.new()
+var _settler_decision_system: SettlerDecisionSystem = SettlerDecisionSystem.new()
+var _economy_system: EconomySystem = EconomySystem.new()
+var _wildlife_system: WildlifeSystem = WildlifeSystem.new()
+var _combat_system: CombatSystem = CombatSystem.new()
 var _settler_happiness: PackedFloat32Array
 var _happiness_gain_mult: float = 1.0
 var _happiness_loss_mult: float = 1.0
@@ -250,6 +312,10 @@ var _settler_attack_speed_mult: float = 1.0
 var _settler_combat_damage_mult: float = 1.0
 var _settler_weapons: PackedInt32Array
 var _settler_tools: PackedInt32Array
+var _settler_next_think_time: PackedFloat32Array
+var _settler_think_state: PackedInt32Array
+var _settler_last_pos: PackedVector2Array
+var _settler_idle_time: PackedFloat32Array
 var _weapon_cluster_strength: float = 0.14
 var _melee_damage_mult: float = 1.0
 var _ranged_damage_mult: float = 1.0
@@ -258,6 +324,8 @@ var _settler_defense_mult: float = 1.0
 var _weapon_bow_unlocked: bool = false
 var _weapon_javelin_unlocked: bool = false
 var _weapon_shield_unlocked: bool = false
+var _weapon_registry: Dictionary = {}  # weapon_id -> WeaponData
+var _weapon_editor_panel: WeaponEditorPanel
 var _poi_spawn_interval_mult: float = 1.0
 var _poi_discovery_radius: float = 18.0
 var _poi_reward_mult: float = 1.0
@@ -285,15 +353,38 @@ var _structure_raze_cooldown: float = 0.0
 var _howl_player: AudioStreamPlayer
 var _howl_stream: AudioStreamGenerator
 var _workshop_paused: bool = false
+var _global_settler_log_lines: Array[String] = []
+var _global_settler_log_flush_accum: float = 0.0
+var _global_settler_snapshot_accum: float = 0.0
+var _global_settler_log_drop_count: int = 0
+var _global_settler_log_active: bool = false
+var _settler_decisions_this_tick: int = 0
+var _settler_decision_cursor: int = 0
+var _perf_panel: PanelContainer
+var _perf_label: RichTextLabel
+var _perf_refresh_accum: float = 0.0
+var _perf_last_frame_ms: float = 0.0
+var _perf_frame_avg_ms: float = 0.0
+var _perf_frame_max_ms: float = 0.0
+var _perf_frame_samples: int = 0
+var _perf_stats: Dictionary = {}
+var _settler_decision_tick_counter: int = 0
 
 
 func _ready() -> void:
 	_rng.randomize()
 	_camera.enabled = true
 	_camera_base_pos = _camera.position
+	_settler_resource_targets = _resource_mgr.settler_resource_targets
+	_resource_claims = _resource_mgr.resource_claims
+	_settler_day_plan_targets = _resource_mgr.settler_day_plan_targets
+	_settler_day_plan_job = _resource_mgr.settler_day_plan_job
 
 	if _agents.agent_count < 1:
 		_agents.agent_count = 1
+
+	_bootstrap_10k_stress_test()
+	_init_global_settler_log()
 
 	var agents: PackedVector2Array = _agents.get_agent_positions()
 	if agents.size() > 0:
@@ -308,8 +399,10 @@ func _ready() -> void:
 	_resources["stone"] = 8.0
 	_resources["cobblestone"] = 0.0
 	_recompute_homes()
-	_clamp_job_counts()
+	_load_weapon_registry()
 	_sync_agent_tracking()
+	_distribute_jobs_evenly()
+	_sync_agent_render_bounds()
 
 	_reveal_around_world(_target, 6)
 	_setup_howl_audio()
@@ -319,6 +412,8 @@ func _ready() -> void:
 	_build_upgrade_ui()
 	_build_hover_ui()
 	_build_poi_ui()
+	_build_performance_debug_ui()
+	_build_weapon_editor_ui()
 	_spawn_initial_pois()
 	_was_night = _is_night()
 
@@ -365,41 +460,90 @@ func _play_howl_warning() -> void:
 
 
 func _process(delta: float) -> void:
+	var frame_start_us: int = Time.get_ticks_usec()
+	var step_start_us: int = Time.get_ticks_usec()
+	_sync_agent_render_bounds()
+	_perf_record_step("sync_agent_render_bounds", step_start_us)
+	step_start_us = Time.get_ticks_usec()
 	_sync_agent_tracking()
+	_perf_record_step("sync_agent_tracking", step_start_us)
+	step_start_us = Time.get_ticks_usec()
 	_update_day_cycle(delta)
+	_perf_record_step("update_day_cycle", step_start_us)
+	step_start_us = Time.get_ticks_usec()
 	_update_raid_warning(delta)
+	_perf_record_step("update_raid_warning", step_start_us)
+	step_start_us = Time.get_ticks_usec()
 	_update_settler_targets(delta)
+	_perf_record_step("update_settler_targets", step_start_us)
+	step_start_us = Time.get_ticks_usec()
+	_update_global_settler_log(delta)
+	_perf_record_step("update_global_settler_log", step_start_us)
+	step_start_us = Time.get_ticks_usec()
 	_update_poi_system(delta)
+	_perf_record_step("update_poi_system", step_start_us)
+	step_start_us = Time.get_ticks_usec()
 	_update_hovered_agent()
+	_perf_record_step("update_hovered_agent", step_start_us)
+	step_start_us = Time.get_ticks_usec()
 	_update_economy(delta)
+	_perf_record_step("update_economy", step_start_us)
+	step_start_us = Time.get_ticks_usec()
 	_update_upgrade_bursts(delta)
+	_perf_record_step("update_upgrade_bursts", step_start_us)
+	step_start_us = Time.get_ticks_usec()
 	_update_floating_texts(delta)
+	_perf_record_step("update_floating_texts", step_start_us)
+	step_start_us = Time.get_ticks_usec()
 	_update_collection_particles(delta)
+	_perf_record_step("update_collection_particles", step_start_us)
+	step_start_us = Time.get_ticks_usec()
 	_update_settler_combat(delta)
+	_perf_record_step("update_settler_combat", step_start_us)
+	step_start_us = Time.get_ticks_usec()
 	_update_camera_kick(delta)
+	_perf_record_step("update_camera_kick", step_start_us)
+	step_start_us = Time.get_ticks_usec()
 	_update_wildlife(delta)
+	_perf_record_step("update_wildlife", step_start_us)
+	step_start_us = Time.get_ticks_usec()
+	_process_world_chunk_streaming(delta)
+	_perf_record_step("world_chunk_streaming", step_start_us)
+	step_start_us = Time.get_ticks_usec()
 	# Advance hunter attack anims
 	for i in range(_hunter_attack_anims.size() - 1, -1, -1):
 		_hunter_attack_anims[i]["t"] = float(_hunter_attack_anims[i]["t"]) + delta
 		if float(_hunter_attack_anims[i]["t"]) >= float(_hunter_attack_anims[i]["dur"]):
 			_hunter_attack_anims.remove_at(i)
+	_perf_record_step("update_hunter_anims", step_start_us)
+	step_start_us = Time.get_ticks_usec()
 	_update_resource_ui()
+	_perf_record_step("update_resource_ui", step_start_us)
+	step_start_us = Time.get_ticks_usec()
 	_update_hover_ui()
+	_perf_record_step("update_hover_ui", step_start_us)
+	step_start_us = Time.get_ticks_usec()
 	_update_happiness(delta)
+	_perf_record_step("update_happiness", step_start_us)
+	step_start_us = Time.get_ticks_usec()
 
 	_minimap_accum += delta
-	if _minimap_accum >= 0.08:
+	if _minimap_accum >= minimap_update_interval_sec:
 		_minimap_accum = 0.0
 		_update_minimap()
+	_perf_record_step("update_minimap_tick", step_start_us)
+	step_start_us = Time.get_ticks_usec()
 
 	_fog_reveal_accum += delta
-	if _fog_reveal_accum >= 0.1:
+	if _fog_reveal_accum >= fog_reveal_update_interval_sec:
 		_fog_reveal_accum = 0.0
 		var agents: PackedVector2Array = _agents.get_agent_positions()
 		for i in agents.size():
 			_reveal_around_world(agents[i], _vision_radius)
 		for ot in _outpost_tiles:
 			_reveal_around_tile(ot, 5)
+	_perf_record_step("update_fog_reveal", step_start_us)
+	step_start_us = Time.get_ticks_usec()
 
 	var day_state: String = "Night" if _is_night() else "Day"
 	_label.text = (
@@ -414,6 +558,8 @@ func _process(delta: float) -> void:
 	]
 
 	queue_redraw()
+	_perf_record_step("queue_redraw", step_start_us)
+	_perf_end_frame(frame_start_us, delta)
 
 
 func _update_raid_warning(delta: float) -> void:
@@ -692,16 +838,39 @@ func _on_poi_decline_pressed() -> void:
 
 
 func _draw() -> void:
+	var draw_step_us: int = Time.get_ticks_usec()
 	_draw_world_tiles()
+	_perf_record_step("draw_world_tiles", draw_step_us)
+	draw_step_us = Time.get_ticks_usec()
 	_draw_night_fx()
+	_perf_record_step("draw_night_fx", draw_step_us)
+	draw_step_us = Time.get_ticks_usec()
 	_draw_watchtowers()
+	_perf_record_step("draw_watchtowers", draw_step_us)
+	draw_step_us = Time.get_ticks_usec()
 	_draw_target()
+	_perf_record_step("draw_target", draw_step_us)
+	draw_step_us = Time.get_ticks_usec()
+	_draw_settler_thinking_indicators()
+	_perf_record_step("draw_settler_thinking_indicators", draw_step_us)
+	draw_step_us = Time.get_ticks_usec()
 	_draw_hover_feedback()
+	_perf_record_step("draw_hover_feedback", draw_step_us)
+	draw_step_us = Time.get_ticks_usec()
 	_draw_upgrade_vfx()
+	_perf_record_step("draw_upgrade_vfx", draw_step_us)
+	draw_step_us = Time.get_ticks_usec()
 	_draw_collection_particles()
+	_perf_record_step("draw_collection_particles", draw_step_us)
+	draw_step_us = Time.get_ticks_usec()
 	_draw_wildlife()
+	_perf_record_step("draw_wildlife", draw_step_us)
+	draw_step_us = Time.get_ticks_usec()
 	_draw_hunter_anims()
+	_perf_record_step("draw_hunter_anims", draw_step_us)
+	draw_step_us = Time.get_ticks_usec()
 	_draw_floating_texts()
+	_perf_record_step("draw_floating_texts", draw_step_us)
 
 
 func _unhandled_input(event: InputEvent) -> void:
@@ -711,6 +880,10 @@ func _unhandled_input(event: InputEvent) -> void:
 
 	if event is InputEventKey and event.pressed and not event.echo and event.keycode == KEY_U:
 		_toggle_upgrade_panel()
+		return
+
+	if event is InputEventKey and event.pressed and not event.echo and event.keycode == KEY_K:
+		_toggle_weapon_editor()
 		return
 
 	if event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_RIGHT:
@@ -749,37 +922,22 @@ func _draw_world_tiles() -> void:
 	var max_x: int = int(ceil((cam.x + half.x) / TILE_SIZE)) + 2
 	var min_y: int = int(floor((cam.y - half.y) / TILE_SIZE)) - 2
 	var max_y: int = int(ceil((cam.y + half.y) / TILE_SIZE)) + 2
+	var chunk_size: int = maxi(4, world_chunk_tiles)
+	var cmin_x: int = floori(float(min_x) / float(chunk_size))
+	var cmax_x: int = floori(float(max_x) / float(chunk_size))
+	var cmin_y: int = floori(float(min_y) / float(chunk_size))
+	var cmax_y: int = floori(float(max_y) / float(chunk_size))
 
-	for y in range(min_y, max_y + 1):
-		for x in range(min_x, max_x + 1):
-			var tile := Vector2i(x, y)
-			var rect := Rect2(x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE)
-			if not _is_explored(tile):
-				draw_rect(rect, Color(0.015, 0.02, 0.03, 1.0))
+	for cy in range(cmin_y, cmax_y + 1):
+		for cx in range(cmin_x, cmax_x + 1):
+			var c: Vector2i = Vector2i(cx, cy)
+			var tex: ImageTexture = _get_world_chunk_texture(c)
+			if tex == null:
+				_request_world_chunk_rebuild(c)
 				continue
-
-			var biome: int = _biome_at(tile)
-			draw_rect(rect, _biome_color(biome))
-
-			var res_type: int = _resource_type_at(tile)
-			if res_type != RES_NONE and _resource_left(tile, res_type) > 0.0:
-				var cx: float = (x + 0.5) * TILE_SIZE
-				var cy: float = (y + 0.5) * TILE_SIZE
-				match res_type:
-					RES_TREE:
-						draw_circle(Vector2(cx, cy), 3.0, Color(0.1, 0.55, 0.18, 0.95))
-					RES_STONE:
-						draw_rect(Rect2(x * TILE_SIZE + 4.0, y * TILE_SIZE + 4.0, 8.0, 8.0), Color(0.58, 0.6, 0.64, 0.95))
-					RES_APPLE:
-						# Green tree with red apple dot
-						draw_circle(Vector2(cx, cy), 3.5, Color(0.12, 0.52, 0.14, 0.95))
-						draw_circle(Vector2(cx + 2.0, cy - 2.0), 1.5, Color(0.92, 0.22, 0.18, 0.95))
-					RES_BERRY_BLUE:
-						draw_circle(Vector2(cx, cy), 2.5, Color(0.22, 0.44, 0.82, 0.95))
-					RES_BERRY_RASP:
-						draw_circle(Vector2(cx, cy), 2.5, Color(0.82, 0.2, 0.32, 0.95))
-					RES_BERRY_BLACK:
-						draw_circle(Vector2(cx, cy), 2.5, Color(0.28, 0.12, 0.36, 0.95))
+			var world_pos := Vector2(float(cx * chunk_size * TILE_SIZE), float(cy * chunk_size * TILE_SIZE))
+			var world_size := Vector2(float(chunk_size * TILE_SIZE), float(chunk_size * TILE_SIZE))
+			draw_texture_rect(tex, Rect2(world_pos, world_size), false, Color(1, 1, 1, 1))
 
 	# Camp and houses
 	_draw_structure_tile(_camp_tile, Color(0.95, 0.73, 0.32, 0.95))
@@ -812,6 +970,171 @@ func _draw_world_tiles() -> void:
 			col = Color(0.95, 0.95, 0.42, 0.98)
 		draw_rect(Rect2(center.x - 3.0, center.y - 3.0, 6.0, 6.0), col)
 		draw_rect(Rect2(center.x - 5.0, center.y - 5.0, 10.0, 10.0), Color(col.r, col.g, col.b, 0.35), false, 1.0)
+
+
+func _world_chunk_key(chunk: Vector2i) -> String:
+	return "%d:%d" % [chunk.x, chunk.y]
+
+
+func _chunk_for_tile(tile: Vector2i) -> Vector2i:
+	var csz: int = maxi(4, world_chunk_tiles)
+	return Vector2i(
+		floori(float(tile.x) / float(csz)),
+		floori(float(tile.y) / float(csz))
+	)
+
+
+func _mark_chunk_dirty(chunk: Vector2i) -> void:
+	var key: String = _world_chunk_key(chunk)
+	_world_chunk_dirty[key] = true
+	_request_world_chunk_rebuild(chunk)
+
+
+func _mark_tile_dirty(tile: Vector2i) -> void:
+	_mark_chunk_dirty(_chunk_for_tile(tile))
+
+
+func _get_world_chunk_texture(chunk: Vector2i) -> ImageTexture:
+	var key: String = _world_chunk_key(chunk)
+	var frame: int = Engine.get_process_frames()
+	_world_chunk_last_used[key] = frame
+	if _world_chunk_textures.has(key) and not bool(_world_chunk_dirty.get(key, false)):
+		return _world_chunk_textures[key]
+	if not _world_chunk_textures.has(key):
+		_request_world_chunk_rebuild(chunk)
+		return null
+	if bool(_world_chunk_dirty.get(key, false)):
+		_request_world_chunk_rebuild(chunk)
+	return _world_chunk_textures[key]
+
+
+func _request_world_chunk_rebuild(chunk: Vector2i) -> void:
+	var key: String = _world_chunk_key(chunk)
+	if _world_chunk_rebuild_queued.has(key):
+		return
+	_world_chunk_rebuild_queued[key] = true
+	_world_chunk_rebuild_queue.append(chunk)
+
+
+func _process_world_chunk_streaming(delta: float) -> void:
+	_world_chunk_prune_accum += delta
+	if world_chunk_rebuild_budget_per_frame > 0:
+		var budget: int = mini(world_chunk_rebuild_budget_per_frame, _world_chunk_rebuild_queue.size())
+		for _i in budget:
+			var chunk: Vector2i = _world_chunk_rebuild_queue.pop_front()
+			var key: String = _world_chunk_key(chunk)
+			_world_chunk_rebuild_queued.erase(key)
+			var tex: ImageTexture = _rebuild_world_chunk_texture(chunk)
+			if tex != null:
+				_world_chunk_textures[key] = tex
+				_world_chunk_dirty[key] = false
+
+	if _world_chunk_prune_accum < world_chunk_prune_interval_sec:
+		return
+	_world_chunk_prune_accum = 0.0
+
+	var vp: Vector2 = get_viewport_rect().size
+	var z: Vector2 = _camera.zoom
+	var half: Vector2 = Vector2(vp.x * 0.5 / z.x, vp.y * 0.5 / z.y)
+	var cam: Vector2 = _camera.position
+	var min_x: int = int(floor((cam.x - half.x) / TILE_SIZE)) - 2
+	var max_x: int = int(ceil((cam.x + half.x) / TILE_SIZE)) + 2
+	var min_y: int = int(floor((cam.y - half.y) / TILE_SIZE)) - 2
+	var max_y: int = int(ceil((cam.y + half.y) / TILE_SIZE)) + 2
+	var chunk_size: int = maxi(4, world_chunk_tiles)
+	var cmin_x: int = floori(float(min_x) / float(chunk_size))
+	var cmax_x: int = floori(float(max_x) / float(chunk_size))
+	var cmin_y: int = floori(float(min_y) / float(chunk_size))
+	var cmax_y: int = floori(float(max_y) / float(chunk_size))
+	_prune_world_chunk_cache(Vector2i((cmin_x + cmax_x) / 2, (cmin_y + cmax_y) / 2), maxi(cmax_x - cmin_x, cmax_y - cmin_y) + 2)
+
+
+func _rebuild_world_chunk_texture(chunk: Vector2i) -> ImageTexture:
+	var csz: int = maxi(4, world_chunk_tiles)
+	var px_size: int = csz * TILE_SIZE
+	var img := Image.create(px_size, px_size, false, Image.FORMAT_RGBA8)
+	img.fill(Color(0.015, 0.02, 0.03, 1.0))
+
+	var tile_origin: Vector2i = Vector2i(chunk.x * csz, chunk.y * csz)
+	for ly in csz:
+		for lx in csz:
+			var tile := Vector2i(tile_origin.x + lx, tile_origin.y + ly)
+			var px: int = lx * TILE_SIZE
+			var py: int = ly * TILE_SIZE
+			if not _is_explored(tile):
+				continue
+			img.fill_rect(Rect2i(px, py, TILE_SIZE, TILE_SIZE), _biome_color(_biome_at(tile)))
+
+			var res_type: int = _resource_type_at(tile)
+			if res_type == RES_NONE or _resource_left(tile, res_type) <= 0.0:
+				continue
+
+			match res_type:
+				RES_TREE:
+					img.fill_rect(Rect2i(px + 5, py + 5, 6, 6), Color(0.1, 0.55, 0.18, 0.95))
+				RES_STONE:
+					img.fill_rect(Rect2i(px + 4, py + 4, 8, 8), Color(0.58, 0.6, 0.64, 0.95))
+				RES_APPLE:
+					img.fill_rect(Rect2i(px + 4, py + 4, 7, 7), Color(0.12, 0.52, 0.14, 0.95))
+					img.fill_rect(Rect2i(px + 9, py + 4, 2, 2), Color(0.92, 0.22, 0.18, 0.95))
+				RES_BERRY_BLUE:
+					img.fill_rect(Rect2i(px + 6, py + 6, 5, 5), Color(0.22, 0.44, 0.82, 0.95))
+				RES_BERRY_RASP:
+					img.fill_rect(Rect2i(px + 6, py + 6, 5, 5), Color(0.82, 0.2, 0.32, 0.95))
+				RES_BERRY_BLACK:
+					img.fill_rect(Rect2i(px + 6, py + 6, 5, 5), Color(0.28, 0.12, 0.36, 0.95))
+
+	if _world_chunk_textures.has(_world_chunk_key(chunk)):
+		var existing: ImageTexture = _world_chunk_textures[_world_chunk_key(chunk)]
+		existing.update(img)
+		return existing
+	return ImageTexture.create_from_image(img)
+
+
+func _prune_world_chunk_cache(center_chunk: Vector2i, keep_radius: int) -> void:
+	if _world_chunk_textures.size() <= world_chunk_cache_max_entries:
+		return
+	var keys: Array = _world_chunk_textures.keys()
+	for key_v in keys:
+		if _world_chunk_textures.size() <= world_chunk_cache_max_entries:
+			break
+		var key: String = String(key_v)
+		var parts: PackedStringArray = key.split(":")
+		if parts.size() != 2:
+			continue
+		var cx: int = int(parts[0])
+		var cy: int = int(parts[1])
+		if abs(cx - center_chunk.x) <= keep_radius and abs(cy - center_chunk.y) <= keep_radius:
+			continue
+		_world_chunk_textures.erase(key)
+		_world_chunk_dirty.erase(key)
+		_world_chunk_last_used.erase(key)
+
+
+func _draw_settler_thinking_indicators() -> void:
+	if not show_settler_thinking_indicator:
+		return
+	var agents: PackedVector2Array = _agents.get_agent_positions()
+	if agents.is_empty() or _settler_think_state.size() != agents.size():
+		return
+
+	var vp: Vector2 = get_viewport_rect().size
+	var z: Vector2 = _camera.zoom
+	var half: Vector2 = Vector2(vp.x * 0.5 / z.x, vp.y * 0.5 / z.y)
+	var cam: Vector2 = _camera.position
+	var min_x: float = cam.x - half.x - 20.0
+	var max_x: float = cam.x + half.x + 20.0
+	var min_y: float = cam.y - half.y - 20.0
+	var max_y: float = cam.y + half.y + 20.0
+
+	for i in agents.size():
+		var pos: Vector2 = agents[i]
+		if pos.x < min_x or pos.x > max_x or pos.y < min_y or pos.y > max_y:
+			continue
+		var state: int = _settler_think_state[i]
+		if state != THINK_THINKING:
+			continue
+		draw_circle(pos + Vector2(0.0, -7.0), 1.6, Color(1.0, 0.86, 0.22, 0.92))
 
 
 func _draw_structure_tile(tile: Vector2i, col: Color) -> void:
@@ -1019,10 +1342,46 @@ func _draw_floating_texts() -> void:
 
 
 func _draw_collection_particles() -> void:
-	for p in _collect_particles:
+	if _collect_particles.is_empty():
+		return
+	_ensure_collect_particle_batch_resources()
+	var count: int = _collect_particles.size()
+	_collect_particle_multimesh.instance_count = count
+	_collect_particle_multimesh.visible_instance_count = count
+	for i in count:
+		var p: Dictionary = _collect_particles[i]
 		var alpha: float = 1.0 - clampf(float(p["t"]) / float(p["dur"]), 0.0, 1.0)
 		var col: Color = p["color"]
-		draw_circle(p["pos"], float(p["size"]), Color(col.r, col.g, col.b, alpha))
+		var size: float = float(p["size"])
+		var pos: Vector2 = p["pos"]
+		_collect_particle_multimesh.set_instance_transform_2d(i, Transform2D(Vector2(size, 0.0), Vector2(0.0, size), pos))
+		_collect_particle_multimesh.set_instance_color(i, Color(col.r, col.g, col.b, alpha))
+	draw_multimesh(_collect_particle_multimesh, _collect_particle_texture)
+
+
+func _ensure_collect_particle_batch_resources() -> void:
+	if _collect_particle_batch_ready:
+		return
+	if _collect_particle_mesh == null:
+		_collect_particle_mesh = QuadMesh.new()
+		_collect_particle_mesh.size = Vector2.ONE
+	if _collect_particle_texture == null:
+		var img: Image = Image.create(16, 16, false, Image.FORMAT_RGBA8)
+		img.fill(Color(0.0, 0.0, 0.0, 0.0))
+		for y in 16:
+			for x in 16:
+				var uv: Vector2 = Vector2(float(x) + 0.5, float(y) + 0.5)
+				var d: float = uv.distance_to(Vector2(8.0, 8.0))
+				var a: float = clampf((7.5 - d) / 2.0, 0.0, 1.0)
+				img.set_pixel(x, y, Color(1.0, 1.0, 1.0, a))
+		_collect_particle_texture = ImageTexture.create_from_image(img)
+	_collect_particle_multimesh.mesh = _collect_particle_mesh
+	_collect_particle_multimesh.instance_count = 0
+	_collect_particle_multimesh.visible_instance_count = 0
+	_collect_particle_multimesh.transform_format = MultiMesh.TRANSFORM_2D
+	_collect_particle_multimesh.use_colors = true
+	_collect_particle_multimesh.use_custom_data = false
+	_collect_particle_batch_ready = true
 
 
 func _draw_night_fx() -> void:
@@ -1064,61 +1423,40 @@ func _draw_night_fx() -> void:
 
 
 func _update_economy(delta: float) -> void:
-	_harvest_tick += delta
-	if _harvest_tick >= 0.35:
-		_harvest_tick = 0.0
-		_harvest_resources()
-
-	# Continuous colony food consumption (scaled by upgrades and population)
-	if _agents.get_agent_count() > 0:
-		var consume: float = _agents.get_agent_count() * _food_consume_per_settler * _food_consume_mult * delta
-		_resources["food"] = maxf(0.0, _resources["food"] - consume)
-
-	# Cooking: housed settlers at night convert 1 food → 2 food slowly (4s per settler)
-	if _is_night():
-		var housed: int = mini(_agents.get_agent_count(), _housing_capacity())
-		if housed > 0 and _resources["food"] >= 1.0:
-			_cook_tick += delta * housed
-			if _cook_tick >= 4.0:
-				_cook_tick = 0.0
-				var cooked: float = minf(_resources["food"], 1.0)
-				_resources["food"] += cooked  # +1 net (consume 1, produce 2)
-				_spawn_floating_text(_tile_center(_camp_tile), "+1 cooked food", Color(0.95, 0.72, 0.25, 1.0))
-		else:
-			_cook_tick = 0.0
-
-	# Berry/apple regrowth: slowly refill depleted food tiles (very slow ~120s per unit)
-	_harvest_tick  # already ticked above
-	var food_res_types := [RES_APPLE, RES_BERRY_BLUE, RES_BERRY_RASP, RES_BERRY_BLACK]
-	for key in _resource_remaining.keys():
-		var parts: Array = String(key).split(":")
-		if parts.size() == 2:
-			var tile := Vector2i(int(parts[0]), int(parts[1]))
-			var rt: int = _resource_type_at(tile)
-			if rt in food_res_types:
-				var cur: float = float(_resource_remaining[key])
-				var max_amt: float = _resource_initial_amount(tile, rt)
-				if cur < max_amt:
-					_resource_remaining[key] = minf(cur + delta / 120.0, max_amt)
-
-	var workshop_count: int = int(_buildings["workshop"])
-	if workshop_count > 0 and not _workshop_paused:
-		var convert_rate: float = (1.2 + workshop_count * 0.9) * _convert_mult
-		var convert: float = minf(_resources["stone"], convert_rate * delta)
-		_resources["stone"] -= convert
-		_resources["cobblestone"] += convert
-
-	var quarry_count: int = int(_buildings["quarry"])
-	if quarry_count > 0:
-		_resources["stone"] += (0.22 * float(quarry_count) * _quarry_passive_mult) * delta
-
-	var store_count: int = int(_buildings["storehouse"])
-	if store_count > 0:
-		_resources["lumber"] += (0.4 * store_count * _storehouse_mult) * delta
-
-	if _outpost_tiles.size() > 0:
-		_resources["food"] += 0.022 * float(_outpost_tiles.size()) * delta
-		_resources["lumber"] += 0.016 * float(_outpost_tiles.size()) * delta
+	var result: Dictionary = _economy_system.run({
+		"delta": delta,
+		"harvest_tick": _harvest_tick,
+		"cook_tick": _cook_tick,
+		"resource_regrow_tick": _resource_regrow_tick,
+		"resources": _resources,
+		"resource_remaining": _resource_remaining,
+		"berry_overnight_regrow_due": _berry_overnight_regrow_due,
+		"buildings": _buildings,
+		"outpost_tiles": _outpost_tiles,
+		"food_consume_per_settler": _food_consume_per_settler,
+		"food_consume_mult": _food_consume_mult,
+		"convert_mult": _convert_mult,
+		"quarry_passive_mult": _quarry_passive_mult,
+		"storehouse_mult": _storehouse_mult,
+		"res_apple": RES_APPLE,
+		"res_berry_blue": RES_BERRY_BLUE,
+		"res_berry_rasp": RES_BERRY_RASP,
+		"res_berry_black": RES_BERRY_BLACK,
+		"camp_tile": _camp_tile,
+		"workshop_paused": _workshop_paused,
+		"cb_harvest_resources": Callable(self, "_harvest_resources"),
+		"cb_agent_count": Callable(_agents, "get_agent_count"),
+		"cb_is_night": Callable(self, "_is_night"),
+		"cb_housing_capacity": Callable(self, "_housing_capacity"),
+		"cb_spawn_floating_text": Callable(self, "_spawn_floating_text"),
+		"cb_tile_center": Callable(self, "_tile_center"),
+		"cb_resource_type_at": Callable(self, "_resource_type_at"),
+		"cb_resource_initial_amount": Callable(self, "_resource_initial_amount"),
+		"cb_mark_tile_dirty": Callable(self, "_mark_tile_dirty"),
+	})
+	_harvest_tick = float(result["harvest_tick"])
+	_cook_tick = float(result["cook_tick"])
+	_resource_regrow_tick = float(result["resource_regrow_tick"])
 
 
 func _update_day_cycle(delta: float) -> void:
@@ -1154,6 +1492,22 @@ func _on_night_start() -> void:
 		_play_howl_warning()
 		_spawn_floating_text(_tile_center(_camp_tile), "Howl heard. Hold for 5 seconds!", Color(1.0, 0.45, 0.4, 1.0))
 		_wolf_next_raid_day = _day_index + 3
+
+	_berry_overnight_regrow_due.clear()
+	var night_duration: float = maxf(1.0, _day_length_seconds * (1.0 - 0.78 + 0.2))
+	for key_v in _resource_remaining.keys():
+		var key: String = String(key_v)
+		var parts: Array = key.split(":")
+		if parts.size() != 2:
+			continue
+		var tile := Vector2i(int(parts[0]), int(parts[1]))
+		var rt: int = _resource_type_at(tile)
+		if rt != RES_BERRY_BLUE and rt != RES_BERRY_RASP and rt != RES_BERRY_BLACK:
+			continue
+		var cur: float = float(_resource_remaining[key])
+		var max_amt: float = _resource_initial_amount(tile, rt)
+		if cur < max_amt:
+			_berry_overnight_regrow_due[key] = _rng.randf_range(0.05, night_duration)
 
 
 func _compute_raid_spawn_counts() -> Dictionary:
@@ -1204,6 +1558,25 @@ func _on_morning_start() -> void:
 	_raid_warning_active = false
 	_pending_wolf_spawn_count = 0
 	_pending_bear_spawn_count = 0
+	if not _berry_overnight_regrow_due.is_empty():
+		for key_v in _berry_overnight_regrow_due.keys():
+			var key: String = String(key_v)
+			var parts: Array = key.split(":")
+			if parts.size() != 2:
+				continue
+			var tile := Vector2i(int(parts[0]), int(parts[1]))
+			var rt: int = _resource_type_at(tile)
+			if rt == RES_BERRY_BLUE or rt == RES_BERRY_RASP or rt == RES_BERRY_BLACK:
+				_resource_remaining[key] = _resource_initial_amount(tile, rt)
+				_mark_tile_dirty(tile)
+		_berry_overnight_regrow_due.clear()
+	if morning_dispatch_spread_sec > 0.0 and _agents.get_agent_count() > 0:
+		_sync_settler_think_buffers(_agents.get_agent_count())
+		var now_sec: float = Time.get_ticks_msec() * 0.001
+		for i in _agents.get_agent_count():
+			var was_blocked: bool = _settler_think_state[i] == THINK_BLOCKED
+			_settler_next_think_time[i] = now_sec if was_blocked else now_sec + _rng.randf_range(0.0, morning_dispatch_spread_sec)
+			_settler_think_state[i] = THINK_EXECUTING
 	var neglect: float = _combat_neglect_level()
 	if neglect >= 0.45:
 		_combat_neglect_streak += 1
@@ -1212,16 +1585,15 @@ func _on_morning_start() -> void:
 	# Shared-home births: chance = happiness / 2, evaluated at dawn
 	var births: int = 0
 	var capacity_left: int = _housing_capacity() - _agents.get_agent_count()
-	if capacity_left <= 0:
-		return
-	for i in _agents.get_agent_count():
-		if births >= capacity_left:
-			break
-		if not _has_housemate(i):
-			continue
-		var chance: float = clampf(_settler_happiness[i] * 0.5, 0.0, 0.5)
-		if _rng.randf() < chance:
-			births += 1
+	if capacity_left > 0:
+		for i in _agents.get_agent_count():
+			if births >= capacity_left:
+				break
+			if not _has_housemate(i):
+				continue
+			var chance: float = clampf(_settler_happiness[i] * 0.5, 0.0, 0.5)
+			if _rng.randf() < chance:
+				births += 1
 	if births > 0:
 		var old_count: int = _agents.get_agent_count()
 		_agents.add_agents(births, _tile_center(_camp_tile))
@@ -1290,7 +1662,7 @@ func _harvest_resources() -> void:
 				var left: float = _resource_left(tile, res_type)
 				var pick: float = minf(left, 1.2 * (1.0 + float(_buildings["camp"]) * 0.1) * _food_gather_mult * tool_mult_farm)
 				if pick < FOOD_MIN_HARVEST:
-					_settler_resource_targets.erase(i)
+					_release_resource_claim(i)
 					continue
 				_set_resource_left(tile, left - pick)
 				food_gain = pick
@@ -1298,11 +1670,12 @@ func _harvest_resources() -> void:
 				food_color = Color(0.92, 0.3, 0.2, 1.0)
 			elif (res_type == RES_BERRY_BLUE or res_type == RES_BERRY_RASP or res_type == RES_BERRY_BLACK) and _resource_left(tile, res_type) >= FOOD_MIN_HARVEST:
 				var left: float = _resource_left(tile, res_type)
-				var pick: float = minf(left, 0.9 * (1.0 + float(_buildings["camp"]) * 0.1) * _food_gather_mult * tool_mult_farm)
+				# Berries are consumed on harvest so the node visually disappears immediately.
+				var pick: float = left
 				if pick < FOOD_MIN_HARVEST:
-					_settler_resource_targets.erase(i)
+					_release_resource_claim(i)
 					continue
-				_set_resource_left(tile, left - pick)
+				_set_resource_left(tile, 0.0)
 				food_gain = pick
 				var berry_names := {RES_BERRY_BLUE: "blueberry", RES_BERRY_RASP: "raspberry", RES_BERRY_BLACK: "blackberry"}
 				food_label = "+%.1f %s" % [pick, berry_names[res_type]]
@@ -1310,7 +1683,7 @@ func _harvest_resources() -> void:
 			if food_gain > 0.0:
 				_resources["food"] += food_gain
 				_record_agent_action(i, "Gathered %s" % food_label)
-				_spawn_collect_feedback(_tile_center(tile), food_label, food_color)
+				_spawn_collect_feedback(_tile_center(tile), _resource_feedback_text("food", food_gain), food_color)
 			continue
 
 		var res_type: int = _resource_type_at(tile)
@@ -1342,11 +1715,11 @@ func _harvest_resources() -> void:
 		if res_type == RES_TREE:
 			_resources["lumber"] += mined
 			_record_agent_action(i, "Chopped +%d lumber" % int(ceil(mined)))
-			_spawn_collect_feedback(center, "+%d lumber" % int(ceil(mined)), Color(0.22, 0.9, 0.34, 1.0))
+			_spawn_collect_feedback(center, _resource_feedback_text("lumber", mined), Color(0.22, 0.9, 0.34, 1.0))
 		else:
 			_resources["stone"] += mined
 			_record_agent_action(i, "Mined +%d stone" % int(ceil(mined)))
-			_spawn_collect_feedback(center, "+%d stone" % int(ceil(mined)), Color(0.8, 0.86, 0.95, 1.0))
+			_spawn_collect_feedback(center, _resource_feedback_text("stone", mined), Color(0.8, 0.86, 0.95, 1.0))
 
 
 func _build_resource_ui() -> void:
@@ -1419,19 +1792,31 @@ func _add_resource_widget(parent: HBoxContainer, key: String, color: Color, add_
 	box.add_theme_constant_override("separation", 6)
 	parent.add_child(box)
 
-	var icon_bg := ColorRect.new()
-	icon_bg.color = color
-	icon_bg.custom_minimum_size = Vector2(18.0, 18.0)
-	box.add_child(icon_bg)
-	_build_resource_icon(icon_bg, key)
+	var icon_lbl := Label.new()
+	icon_lbl.text = _resource_icon(key)
+	icon_lbl.custom_minimum_size = Vector2(18.0, 18.0)
+	icon_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	icon_lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	icon_lbl.add_theme_font_size_override("font_size", 15)
+	icon_lbl.modulate = color
+	box.add_child(icon_lbl)
 
 	var lbl := Label.new()
-	lbl.text = "%s: 0" % key.capitalize()
+	lbl.text = "0.0" if key == "food" else "0"
 	lbl.add_theme_font_size_override("font_size", 15)
 	box.add_child(lbl)
 	_resource_labels[key] = lbl
 
 	if add_job_key != "":
+		var count_lbl := Label.new()
+		count_lbl.text = "👥 0"
+		count_lbl.custom_minimum_size = Vector2(42.0, 0.0)
+		count_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+		count_lbl.add_theme_font_size_override("font_size", 12)
+		count_lbl.modulate = Color(0.82, 0.9, 0.98, 0.95)
+		box.add_child(count_lbl)
+		_resource_job_labels[key] = count_lbl
+
 		var add_btn := Button.new()
 		add_btn.text = "+"
 		add_btn.custom_minimum_size = Vector2(22.0, 22.0)
@@ -1440,41 +1825,24 @@ func _add_resource_widget(parent: HBoxContainer, key: String, color: Color, add_
 		box.add_child(add_btn)
 
 
-func _build_resource_icon(parent: Control, key: String) -> void:
-	var ink := Color(0.02, 0.03, 0.05, 1.0)
+func _resource_icon(key: String) -> String:
 	match key:
-		"lumber":
-			_add_resource_icon_block(parent, Rect2(4, 3, 3, 12), ink)
-			_add_resource_icon_block(parent, Rect2(10, 3, 3, 12), ink)
-			_add_resource_icon_block(parent, Rect2(4, 2, 3, 1), ink)
-			_add_resource_icon_block(parent, Rect2(10, 14, 3, 1), ink)
-		"stone":
-			_add_resource_icon_block(parent, Rect2(4, 6, 4, 4), ink)
-			_add_resource_icon_block(parent, Rect2(8, 4, 5, 5), ink)
-			_add_resource_icon_block(parent, Rect2(11, 8, 3, 4), ink)
-			_add_resource_icon_block(parent, Rect2(6, 10, 4, 3), ink)
-		"cobblestone":
-			_add_resource_icon_block(parent, Rect2(3, 4, 5, 3), ink)
-			_add_resource_icon_block(parent, Rect2(9, 4, 6, 3), ink)
-			_add_resource_icon_block(parent, Rect2(4, 8, 4, 3), ink)
-			_add_resource_icon_block(parent, Rect2(9, 8, 5, 3), ink)
-			_add_resource_icon_block(parent, Rect2(3, 12, 5, 2), ink)
-			_add_resource_icon_block(parent, Rect2(9, 12, 6, 2), ink)
 		"food":
-			_add_resource_icon_block(parent, Rect2(7, 2, 2, 3), ink)
-			_add_resource_icon_block(parent, Rect2(4, 7, 3, 3), ink)
-			_add_resource_icon_block(parent, Rect2(8, 5, 3, 3), ink)
-			_add_resource_icon_block(parent, Rect2(11, 8, 3, 3), ink)
+			return "🍎"
+		"lumber":
+			return "🪵"
+		"stone":
+			return "🪨"
+		"cobblestone":
+			return "🧱"
 		_:
-			_add_resource_icon_block(parent, Rect2(6, 6, 6, 6), ink)
+			return "◼"
 
 
-func _add_resource_icon_block(parent: Control, rect: Rect2, color: Color) -> void:
-	var block := ColorRect.new()
-	block.color = color
-	block.position = rect.position
-	block.custom_minimum_size = rect.size
-	parent.add_child(block)
+func _resource_feedback_text(key: String, amount: float) -> String:
+	if key == "food":
+		return "%s +%.1f" % [_resource_icon(key), amount]
+	return "%s +%d" % [_resource_icon(key), int(ceil(amount))]
 
 
 func _update_resource_ui() -> void:
@@ -1488,9 +1856,30 @@ func _update_resource_ui() -> void:
 			_resource_labels.erase(key)
 			continue
 		if String(key) == "food":
-			lbl.text = "%s: %.1f" % [String(key).capitalize(), float(_resources[key])]
+			lbl.text = "%.1f" % float(_resources[key])
 		else:
-			lbl.text = "%s: %d" % [String(key).capitalize(), int(_resources[key])]
+			lbl.text = "%d" % int(_resources[key])
+	for key in _resource_job_labels.keys():
+		var count_lbl_obj: Variant = _resource_job_labels[key]
+		if not is_instance_valid(count_lbl_obj):
+			_resource_job_labels.erase(key)
+			continue
+		var count_lbl: Label = count_lbl_obj as Label
+		if count_lbl == null:
+			_resource_job_labels.erase(key)
+			continue
+		var job_key := ""
+		match String(key):
+			"food":
+				job_key = "farm"
+			"lumber":
+				job_key = "lumber"
+			"stone":
+				job_key = "stone"
+			"cobblestone":
+				job_key = "hunt"
+		if job_key != "":
+			count_lbl.text = "👥 %d" % int(_job_counts.get(job_key, 0))
 	for b_key in _building_labels.keys():
 		var b_lbl_obj: Variant = _building_labels[b_key]
 		if not is_instance_valid(b_lbl_obj):
@@ -1697,7 +2086,9 @@ func _set_pinned_settler_job(job_id: int) -> void:
 		var name_map := {JOB_FARM: "Farmer", JOB_LUMBER: "Lumberjack", JOB_STONE: "Stone Miner", JOB_HUNT: "Hunter", JOB_SCOUT: "Scout"}
 		_record_agent_action(_pinned_agent_idx, "Job set to %s" % name_map[job_id])
 	# Clear cached resource target so the new job takes effect immediately
-	_settler_resource_targets.erase(_pinned_agent_idx)
+	_release_resource_claim(_pinned_agent_idx)
+	_settler_day_plan_targets.erase(_pinned_agent_idx)
+	_settler_day_plan_job.erase(_pinned_agent_idx)
 	_agent_last_state.erase(_pinned_agent_idx)
 	_rebalance_settler_weapons()
 
@@ -1739,29 +2130,12 @@ func _inspected_agent_idx() -> int:
 
 func _sync_agent_tracking() -> void:
 	var count: int = _agents.get_agent_count()
-	if _settler_happiness.size() != count:
-		var old_happiness := _settler_happiness
-		_settler_happiness.resize(count)
-		for i in count:
-			if i < old_happiness.size():
-				_settler_happiness[i] = old_happiness[i]
-			else:
-				_settler_happiness[i] = clampf(0.52 + _rng.randf_range(-0.06, 0.12), 0.0, 1.0)
-	if _settler_attack_cooldowns.size() != count:
-		var old_cd := _settler_attack_cooldowns
-		_settler_attack_cooldowns.resize(count)
-		for i in count:
-			_settler_attack_cooldowns[i] = old_cd[i] if i < old_cd.size() else _rng.randf_range(0.0, 0.5)
-	if _settler_weapons.size() != count:
-		var old_weapons := _settler_weapons
-		_settler_weapons.resize(count)
-		for i in count:
-			_settler_weapons[i] = old_weapons[i] if i < old_weapons.size() else WEAPON_SPEAR
-	if _settler_tools.size() != count:
-		var old_tools := _settler_tools
-		_settler_tools.resize(count)
-		for i in count:
-			_settler_tools[i] = old_tools[i] if i < old_tools.size() else TOOL_HAND
+	_settler_mgr.ensure_core_buffers(count, _rng, WEAPON_SPEAR, TOOL_HAND)
+	_settler_happiness = _settler_mgr.happiness
+	_settler_attack_cooldowns = _settler_mgr.attack_cooldowns
+	_settler_weapons = _settler_mgr.weapons
+	_settler_tools = _settler_mgr.tools
+	_sync_settler_think_buffers(count)
 	_rebalance_settler_weapons()
 	for i in count:
 		if not _agent_recent_actions.has(i):
@@ -1777,18 +2151,45 @@ func _sync_agent_tracking() -> void:
 			_settler_names.append("Settler %d" % (idx + 1))
 	if _pinned_agent_idx >= count:
 		_pinned_agent_idx = -1
+	_cleanup_resource_claims(count)
+
+
+func _cleanup_resource_claims(settler_count: int) -> void:
+	_resource_mgr.cleanup_claims(settler_count, Callable(self, "_tile_key"))
+
+
+func _sync_settler_think_buffers(count: int) -> void:
+	var now: float = Time.get_ticks_msec() * 0.001
+	_settler_mgr.ensure_think_buffers(
+		count,
+		_agents.get_agent_positions(),
+		now,
+		settler_think_jitter_sec,
+		_rng,
+		THINK_EXECUTING
+	)
+	_settler_next_think_time = _settler_mgr.next_think_time
+	_settler_think_state = _settler_mgr.think_state
+	_settler_last_pos = _settler_mgr.last_pos
+	_settler_idle_time = _settler_mgr.idle_time
+
+
+func _think_jitter() -> float:
+	if settler_think_jitter_sec <= 0.0:
+		return 0.0
+	return _rng.randf_range(-settler_think_jitter_sec, settler_think_jitter_sec)
+
+
+func _schedule_next_think(index: int, now_sec: float, idle: bool = false) -> void:
+	if index < 0 or index >= _settler_next_think_time.size():
+		return
+	var base: float = settler_idle_think_interval_sec if idle else settler_active_think_interval_sec
+	_settler_next_think_time[index] = now_sec + maxf(0.1, base + _think_jitter())
 
 
 func _weapon_name_for_id(weapon_id: int) -> String:
-	match weapon_id:
-		WEAPON_SHIELD:
-			return "Shield"
-		WEAPON_BOW:
-			return "Bow"
-		WEAPON_JAVELIN:
-			return "Javelin"
-		_:
-			return "Spear"
+	var profile: Dictionary = _weapon_profile(weapon_id)
+	return String(profile.get("name", "Weapon"))
 
 
 func _tool_name_for_id(tool_id: int) -> String:
@@ -1842,43 +2243,10 @@ func _tool_effect_text(index: int, job: int) -> String:
 
 
 func _weapon_profile(weapon_id: int) -> Dictionary:
-	match weapon_id:
-		WEAPON_SHIELD:
-			return {
-				"name": "Shield",
-				"range": 26.0,
-				"damage": 0.85,
-				"cooldown": 1.05,
-				"defense": 1.45,
-				"ranged": false,
-			}
-		WEAPON_BOW:
-			return {
-				"name": "Bow",
-				"range": 90.0 * _ranged_range_mult,
-				"damage": 0.92,
-				"cooldown": 1.2,
-				"defense": 0.65,
-				"ranged": true,
-			}
-		WEAPON_JAVELIN:
-			return {
-				"name": "Javelin",
-				"range": 66.0 * _ranged_range_mult,
-				"damage": 1.25,
-				"cooldown": 1.55,
-				"defense": 0.78,
-				"ranged": true,
-			}
-		_:
-			return {
-				"name": "Spear",
-				"range": 34.0,
-				"damage": 1.0,
-				"cooldown": 1.4,
-				"defense": 1.0,
-				"ranged": false,
-			}
+	var data: WeaponData = _weapon_registry.get(weapon_id, null)
+	if data == null:
+		data = _default_weapon_data(weapon_id)
+	return data.to_profile(_ranged_range_mult)
 
 
 func _weapon_for_settler(index: int) -> int:
@@ -1939,6 +2307,117 @@ func _record_agent_action(index: int, message: String) -> void:
 	while actions.size() > 6:
 		actions.pop_back()
 	_agent_recent_actions[index] = actions
+	var agents: PackedVector2Array = _agents.get_agent_positions()
+	var pos: Vector2 = agents[index] if index >= 0 and index < agents.size() else Vector2.ZERO
+	_log_global_settler_event("action", index, _job_for_settler(index), String(_agent_last_state.get(index, "")), pos, line)
+
+
+func _bootstrap_10k_stress_test() -> void:
+	if not run_10k_settler_stress_test:
+		return
+	var target_count: int = maxi(400, stress_test_settler_target)
+	var current_count: int = _agents.get_agent_count()
+	if current_count >= target_count:
+		return
+	if _agents.infinite_mode:
+		_agents.add_agents(target_count - current_count, _target)
+		_record_agent_action(0, "Stress test enabled: scaled settlers to %d" % target_count)
+	else:
+		push_warning("10k stress test requires AgentSystem.infinite_mode=true or a preconfigured agent_count >= target")
+
+
+func _init_global_settler_log() -> void:
+	_global_settler_log_active = enable_global_settler_log
+	if not _global_settler_log_active:
+		return
+	var f: FileAccess = FileAccess.open(global_settler_log_path, FileAccess.WRITE)
+	if f == null:
+		_global_settler_log_active = false
+		push_warning("Failed to open global settler log file at %s" % global_settler_log_path)
+		return
+	var now: String = Time.get_datetime_string_from_system()
+	f.store_line("session_start,%s" % now)
+	f.store_line("msec,frame,event,settler,job_id,job_name,state,target_x,target_y,message")
+	f.close()
+
+
+func _update_global_settler_log(delta: float) -> void:
+	if not _global_settler_log_active:
+		return
+	_global_settler_log_flush_accum += delta
+	_global_settler_snapshot_accum += delta
+	if _global_settler_snapshot_accum >= global_settler_snapshot_sec:
+		_global_settler_snapshot_accum = 0.0
+		_log_global_snapshot()
+	if _global_settler_log_flush_accum >= global_settler_log_flush_sec:
+		_global_settler_log_flush_accum = 0.0
+		_flush_global_settler_log()
+
+
+func _log_global_snapshot() -> void:
+	var targets: PackedVector2Array = _agents.get_agent_targets()
+	var count: int = _agents.get_agent_count()
+	for i in count:
+		var target: Vector2 = targets[i] if i < targets.size() else Vector2.ZERO
+		_log_global_settler_event("snapshot", i, _job_for_settler(i), String(_agent_last_state.get(i, "")), target, "")
+
+
+func _log_global_settler_event(event_name: String, settler_idx: int, job_id: int, state_tag: String, target: Vector2, message: String) -> void:
+	if not _global_settler_log_active:
+		return
+	if _global_settler_log_lines.size() >= global_settler_log_max_buffered_lines:
+		_global_settler_log_drop_count += 1
+		return
+	var clean_state: String = state_tag.replace(",", ";")
+	var clean_msg: String = message.replace(",", ";")
+	var row: String = "%d,%d,%s,%d,%d,%s,%s,%.2f,%.2f,%s" % [
+		Time.get_ticks_msec(),
+		Engine.get_process_frames(),
+		event_name,
+		settler_idx,
+		job_id,
+		_job_name_from_id(job_id),
+		clean_state,
+		target.x,
+		target.y,
+		clean_msg,
+	]
+	_global_settler_log_lines.append(row)
+
+
+func _flush_global_settler_log() -> void:
+	if not _global_settler_log_active:
+		return
+	if _global_settler_log_lines.is_empty() and _global_settler_log_drop_count <= 0:
+		return
+	var f: FileAccess = FileAccess.open(global_settler_log_path, FileAccess.READ_WRITE)
+	if f == null:
+		push_warning("Unable to flush global settler log")
+		return
+	f.seek_end()
+	for line in _global_settler_log_lines:
+		f.store_line(line)
+	if _global_settler_log_drop_count > 0:
+		f.store_line("%d,%d,drop,-1,-1,NA,NA,0.00,0.00,dropped_%d_buffered_rows" % [Time.get_ticks_msec(), Engine.get_process_frames(), _global_settler_log_drop_count])
+		_global_settler_log_drop_count = 0
+	f.close()
+	_global_settler_log_lines.clear()
+
+
+func _job_name_from_id(job_id: int) -> String:
+	match job_id:
+		JOB_FARM:
+			return "farmer"
+		JOB_LUMBER:
+			return "lumber"
+		JOB_STONE:
+			return "stone"
+		JOB_HUNT:
+			return "hunt"
+		JOB_SCOUT:
+			return "scout"
+		_:
+			return "unknown"
 
 
 func _action_icon(action: String) -> String:
@@ -2262,7 +2741,7 @@ func _build_upgrade_ui() -> void:
 	_upgrade_content_scroll.add_child(_upgrade_content_col)
 
 	# Build category buttons
-	var categories: Array = ["Volume", "Efficiency", "Specialization", "Vision & Exploration", "Scouting", "Defense", "Combat", "Buildings", "Population", "Jobs"]
+	var categories: Array = ["Volume", "Efficiency", "Specialization", "Vision & Exploration", "Scouting", "Defense", "Combat", "Buildings", "Population", "Jobs", "Debug"]
 	for cat in categories:
 		var btn := Button.new()
 		btn.text = cat
@@ -2311,6 +2790,8 @@ func _on_upgrade_category_selected(cat: String) -> void:
 			_build_population_tab(_upgrade_content_col)
 		"Jobs":
 			_build_jobs_tab(_upgrade_content_col)
+		"Debug":
+			_build_debug_tab(_upgrade_content_col)
 
 	# Scroll back to top
 	_upgrade_content_scroll.scroll_vertical = 0
@@ -2348,6 +2829,32 @@ func _build_jobs_tab(page: VBoxContainer) -> void:
 	page.add_child(_make_job_row("scout", "Scouts (requires Scout Lodge)"))
 
 	_update_job_labels()
+
+
+func _build_debug_tab(page: VBoxContainer) -> void:
+	var title := Label.new()
+	title.text = "Performance Debug"
+	title.add_theme_font_size_override("font_size", 15)
+	page.add_child(title)
+
+	var hint := Label.new()
+	hint.text = "Tracks expensive systems per frame with avg/max timing. Use toggle to hide the on-screen debug panel."
+	hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	hint.modulate = Color(0.86, 0.9, 0.98, 0.9)
+	hint.add_theme_font_size_override("font_size", 11)
+	page.add_child(hint)
+
+	_debug_panel_toggle_btn = Button.new()
+	_debug_panel_toggle_btn.custom_minimum_size = Vector2(180.0, 34.0)
+	_debug_panel_toggle_btn.pressed.connect(_on_toggle_debug_panel_pressed)
+	page.add_child(_debug_panel_toggle_btn)
+	_sync_debug_panel_toggle_button()
+
+	var clear_btn := Button.new()
+	clear_btn.text = "Reset Timing History"
+	clear_btn.custom_minimum_size = Vector2(180.0, 30.0)
+	clear_btn.pressed.connect(_reset_perf_stats)
+	page.add_child(clear_btn)
 
 
 func _make_population_action_row(action_id: String, data: Dictionary) -> Control:
@@ -2583,6 +3090,157 @@ func _toggle_upgrade_panel() -> void:
 	_upgrade_toggle.text = "Hide" if _panel_open else "Upgrades"
 
 
+func _build_performance_debug_ui() -> void:
+	var ui_layer: CanvasLayer = $UI
+	_perf_panel = PanelContainer.new()
+	_perf_panel.size = Vector2(430.0, 270.0)
+	_perf_panel.visible = show_performance_debug_panel
+	ui_layer.add_child(_perf_panel)
+
+	var panel_style := StyleBoxFlat.new()
+	panel_style.bg_color = Color(0.05, 0.08, 0.12, 0.92)
+	panel_style.border_width_left = 1
+	panel_style.border_width_top = 1
+	panel_style.border_width_right = 1
+	panel_style.border_width_bottom = 1
+	panel_style.border_color = Color(0.32, 0.56, 0.7, 0.95)
+	panel_style.corner_radius_top_left = 2
+	panel_style.corner_radius_top_right = 2
+	panel_style.corner_radius_bottom_left = 2
+	panel_style.corner_radius_bottom_right = 2
+	_perf_panel.add_theme_stylebox_override("panel", panel_style)
+
+	var margin := MarginContainer.new()
+	margin.add_theme_constant_override("margin_left", 10)
+	margin.add_theme_constant_override("margin_right", 10)
+	margin.add_theme_constant_override("margin_top", 8)
+	margin.add_theme_constant_override("margin_bottom", 8)
+	_perf_panel.add_child(margin)
+
+	var col := VBoxContainer.new()
+	col.add_theme_constant_override("separation", 6)
+	margin.add_child(col)
+
+	var title := Label.new()
+	title.text = "Performance Breakdown"
+	title.add_theme_font_size_override("font_size", 15)
+	col.add_child(title)
+
+	_perf_label = RichTextLabel.new()
+	_perf_label.bbcode_enabled = true
+	_perf_label.scroll_active = true
+	_perf_label.fit_content = false
+	_perf_label.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_perf_label.add_theme_font_size_override("normal_font_size", 12)
+	col.add_child(_perf_label)
+
+	_position_performance_panel()
+	_sync_debug_panel_toggle_button()
+	_refresh_perf_panel_text()
+
+
+func _on_toggle_debug_panel_pressed() -> void:
+	show_performance_debug_panel = not show_performance_debug_panel
+	if _perf_panel != null:
+		_perf_panel.visible = show_performance_debug_panel
+	_sync_debug_panel_toggle_button()
+
+
+func _sync_debug_panel_toggle_button() -> void:
+	if _debug_panel_toggle_btn != null and is_instance_valid(_debug_panel_toggle_btn):
+		_debug_panel_toggle_btn.text = "Hide Debug Panel" if show_performance_debug_panel else "Show Debug Panel"
+
+
+func _reset_perf_stats() -> void:
+	_perf_stats.clear()
+	_perf_frame_avg_ms = 0.0
+	_perf_frame_max_ms = 0.0
+	_perf_frame_samples = 0
+	_refresh_perf_panel_text()
+
+
+func _perf_record_step(step_name: String, start_us: int) -> void:
+	var elapsed_ms: float = float(Time.get_ticks_usec() - start_us) * 0.001
+	var stat: Dictionary = _perf_stats.get(step_name, {
+		"avg_ms": 0.0,
+		"max_ms": 0.0,
+		"last_ms": 0.0,
+		"samples": 0,
+	})
+	var samples: int = int(stat["samples"]) + 1
+	var prev_avg: float = float(stat["avg_ms"])
+	stat["avg_ms"] = prev_avg + (elapsed_ms - prev_avg) / float(samples)
+	stat["last_ms"] = elapsed_ms
+	stat["max_ms"] = maxf(float(stat["max_ms"]), elapsed_ms)
+	stat["samples"] = samples
+	_perf_stats[step_name] = stat
+
+
+func _perf_end_frame(frame_start_us: int, delta: float) -> void:
+	_perf_last_frame_ms = float(Time.get_ticks_usec() - frame_start_us) * 0.001
+	_perf_frame_samples += 1
+	_perf_frame_avg_ms += (_perf_last_frame_ms - _perf_frame_avg_ms) / float(_perf_frame_samples)
+	_perf_frame_max_ms = maxf(_perf_frame_max_ms, _perf_last_frame_ms)
+	_perf_refresh_accum += delta
+	if _perf_refresh_accum >= performance_debug_refresh_sec:
+		_perf_refresh_accum = 0.0
+		_refresh_perf_panel_text()
+
+
+func _refresh_perf_panel_text() -> void:
+	if _perf_label == null or not is_instance_valid(_perf_label):
+		return
+	var lines: Array[String] = []
+	var thinking_count: int = 0
+	var executing_count: int = 0
+	var blocked_count: int = 0
+	for state in _settler_think_state:
+		if int(state) == THINK_THINKING:
+			thinking_count += 1
+		elif int(state) == THINK_BLOCKED:
+			blocked_count += 1
+		else:
+			executing_count += 1
+	lines.append("[color=#a8d9ff]Settlers:[/color] %d    [color=#a8d9ff]FPS:[/color] %d" % [_agents.get_agent_count(), Engine.get_frames_per_second()])
+	lines.append("[color=#a8d9ff]Frame ms[/color] last %.2f | avg %.2f | max %.2f" % [_perf_last_frame_ms, _perf_frame_avg_ms, _perf_frame_max_ms])
+	lines.append("[color=#a8d9ff]Decisions/tick:[/color] %d" % _settler_decisions_this_tick)
+	lines.append("[color=#a8d9ff]States[/color] thinking %d | executing %d | blocked %d" % [thinking_count, executing_count, blocked_count])
+	lines.append("[color=#8fb7cc]Top expensive systems (avg ms):[/color]")
+
+	var rows: Array[Dictionary] = []
+	for key_v in _perf_stats.keys():
+		var key: String = String(key_v)
+		var stat: Dictionary = _perf_stats[key]
+		rows.append({
+			"name": key,
+			"avg": float(stat.get("avg_ms", 0.0)),
+			"max": float(stat.get("max_ms", 0.0)),
+			"last": float(stat.get("last_ms", 0.0)),
+		})
+	rows.sort_custom(Callable(self, "_sort_perf_rows_desc"))
+
+	var shown: int = mini(14, rows.size())
+	for i in shown:
+		var row: Dictionary = rows[i]
+		lines.append("• %s  [avg %.3f | max %.3f | last %.3f]" % [String(row["name"]), float(row["avg"]), float(row["max"]), float(row["last"])])
+
+	_perf_label.text = "\n".join(lines)
+
+
+func _sort_perf_rows_desc(a: Dictionary, b: Dictionary) -> bool:
+	return float(a.get("avg", 0.0)) > float(b.get("avg", 0.0))
+
+
+func _position_performance_panel() -> void:
+	if _perf_panel == null:
+		return
+	var vp := get_viewport_rect().size
+	var margin_x: float = 12.0
+	var min_y: float = MINIMAP_TILES * _minimap_scale + 106.0
+	var max_y: float = maxf(52.0, vp.y - _perf_panel.size.y - 10.0)
+	_perf_panel.position = Vector2(margin_x, minf(min_y, max_y))
+
+
 func _build_minimap_ui() -> void:
 	var ui_layer: CanvasLayer = $UI
 	_minimap_image = Image.create(MINIMAP_TILES, MINIMAP_TILES, false, Image.FORMAT_RGBA8)
@@ -2762,6 +3420,21 @@ func _job_for_settler(index: int) -> int:
 	return JOB_STONE
 
 
+func _distribute_jobs_evenly() -> void:
+	var settlers: int = _agents.get_agent_count()
+	if settlers <= 0:
+		return
+	# Spread across the 5 roles using floored integer quotient and
+	# distribute any remainder one-per-role from the top.
+	var jobs: Array[String] = ["farm", "lumber", "stone", "hunt", "scout"]
+	var n: int = jobs.size()
+	var base: int = settlers / n
+	var remainder: int = settlers % n
+	for idx in n:
+		_job_counts[jobs[idx]] = base + (1 if idx < remainder else 0)
+	_clamp_job_counts()
+
+
 func _clamp_job_counts() -> void:
 	var settlers: int = _agents.get_agent_count()
 	var farm: int = clampi(int(_job_counts["farm"]), 0, settlers)
@@ -2823,7 +3496,104 @@ func _home_center_for_settler(index: int) -> Vector2:
 	return _tile_center(_house_tiles[home_idx])
 
 
-func _nearest_resource_tile(from_tile: Vector2i, res_type: int, max_radius: int = 26) -> Vector2i:
+func _is_tile_claimed_by_other(tile: Vector2i, settler_index: int) -> bool:
+	return _resource_mgr.is_tile_claimed_by_other(_tile_key(tile), settler_index)
+
+
+func _release_resource_claim(settler_index: int) -> void:
+	if not _settler_resource_targets.has(settler_index):
+		return
+	var tile: Vector2i = _settler_resource_targets[settler_index]
+	_resource_mgr.release_resource_claim(settler_index, _tile_key(tile))
+
+
+func _try_claim_resource_tile(settler_index: int, tile: Vector2i) -> bool:
+	var key: String = _tile_key(tile)
+	var prev_key: String = ""
+	if _settler_resource_targets.has(settler_index):
+		var prev: Vector2i = _settler_resource_targets[settler_index]
+		prev_key = _tile_key(prev)
+	return _resource_mgr.try_claim_resource_tile(settler_index, tile, key, prev_key)
+
+
+func _is_resource_job(job: int) -> bool:
+	return job == JOB_FARM or job == JOB_LUMBER or job == JOB_STONE
+
+
+func _is_day_plan_valid(settler_index: int, plan_tile: Vector2i, job: int) -> bool:
+	if plan_tile == Vector2i(-9999, -9999):
+		return false
+	if not _is_resource_job(job):
+		return false
+	if job == JOB_FARM:
+		var rt: int = _resource_type_at(plan_tile)
+		if rt != RES_APPLE and rt != RES_BERRY_BLUE and rt != RES_BERRY_RASP and rt != RES_BERRY_BLACK:
+			return false
+		if _resource_left(plan_tile, rt) < FOOD_MIN_HARVEST:
+			return false
+	else:
+		var rtype: int = RES_TREE if job == JOB_LUMBER else RES_STONE
+		if _resource_type_at(plan_tile) != rtype:
+			return false
+		if _resource_left(plan_tile, rtype) <= 0.0:
+			return false
+	if _is_tile_claimed_by_other(plan_tile, settler_index):
+		return false
+	return true
+
+
+func _update_day_plan_for_settler(settler_index: int, from_tile: Vector2i, job: int) -> void:
+	if not _is_resource_job(job):
+		_settler_day_plan_targets.erase(settler_index)
+		_settler_day_plan_job.erase(settler_index)
+		return
+	if _settler_day_plan_targets.has(settler_index) and _settler_day_plan_job.has(settler_index):
+		var cached_job: int = int(_settler_day_plan_job[settler_index])
+		var cached_tile: Vector2i = _settler_day_plan_targets[settler_index]
+		if cached_job == job and _is_day_plan_valid(settler_index, cached_tile, job):
+			return
+
+	var plan: Vector2i = Vector2i(-9999, -9999)
+	if job == JOB_FARM:
+		plan = _nearest_food_tile(from_tile, settler_index)
+	else:
+		var rtype: int = RES_TREE if job == JOB_LUMBER else RES_STONE
+		plan = _nearest_resource_tile(from_tile, rtype, settler_index)
+
+	if plan == Vector2i(-9999, -9999):
+		_settler_day_plan_targets.erase(settler_index)
+		_settler_day_plan_job.erase(settler_index)
+		return
+	_settler_day_plan_targets[settler_index] = plan
+	_settler_day_plan_job[settler_index] = job
+
+
+func _segment_target_toward(from_tile: Vector2i, goal_tile: Vector2i) -> Vector2i:
+	var max_step: int = maxi(1, settler_route_segment_tiles)
+	var dx: int = goal_tile.x - from_tile.x
+	var dy: int = goal_tile.y - from_tile.y
+	var adx: int = absi(dx)
+	var ady: int = absi(dy)
+	var dist_tiles: int = maxi(adx, ady)
+	if dist_tiles <= max_step:
+		return goal_tile
+	var ratio: float = float(max_step) / float(maxi(1, dist_tiles))
+	var step_x: int = int(round(float(dx) * ratio))
+	var step_y: int = int(round(float(dy) * ratio))
+	if step_x == 0 and dx != 0:
+		step_x = 1 if dx > 0 else -1
+	if step_y == 0 and dy != 0:
+		step_y = 1 if dy > 0 else -1
+	return Vector2i(from_tile.x + step_x, from_tile.y + step_y)
+
+
+func _segment_world_target(from_tile: Vector2i, goal_world: Vector2) -> Vector2:
+	var goal_tile: Vector2i = _world_to_tile(goal_world)
+	var move_tile: Vector2i = _segment_target_toward(from_tile, goal_tile)
+	return _tile_center(move_tile)
+
+
+func _nearest_resource_tile(from_tile: Vector2i, res_type: int, claimant_index: int = -1, max_radius: int = 26) -> Vector2i:
 	for r in range(0, max_radius + 1):
 		for y in range(from_tile.y - r, from_tile.y + r + 1):
 			for x in range(from_tile.x - r, from_tile.x + r + 1):
@@ -2834,11 +3604,13 @@ func _nearest_resource_tile(from_tile: Vector2i, res_type: int, max_radius: int 
 					continue
 				if _resource_left(tile, res_type) <= 0.0:
 					continue
+				if claimant_index >= 0 and _is_tile_claimed_by_other(tile, claimant_index):
+					continue
 				return tile
-	return from_tile
+	return Vector2i(-9999, -9999)
 
 
-func _nearest_food_tile(from_tile: Vector2i, max_radius: int = 32) -> Vector2i:
+func _nearest_food_tile(from_tile: Vector2i, claimant_index: int = -1, max_radius: int = 32) -> Vector2i:
 	for r in range(0, max_radius + 1):
 		for y in range(from_tile.y - r, from_tile.y + r + 1):
 			for x in range(from_tile.x - r, from_tile.x + r + 1):
@@ -2850,8 +3622,10 @@ func _nearest_food_tile(from_tile: Vector2i, max_radius: int = 32) -> Vector2i:
 					continue
 				if _resource_left(tile, rt) < FOOD_MIN_HARVEST:
 					continue
+				if claimant_index >= 0 and _is_tile_claimed_by_other(tile, claimant_index):
+					continue
 				return tile
-	return from_tile
+	return Vector2i(-9999, -9999)
 
 
 func _nearest_wildlife_pos(from_pos: Vector2, prefer_wolf: bool = true) -> Vector2:
@@ -2929,100 +3703,103 @@ func _select_poi_scout(agents: PackedVector2Array, poi_target: Vector2) -> int:
 
 func _update_settler_targets(delta: float) -> void:
 	_ai_tick += delta
-	if _ai_tick < 0.35:
-		return
-	_ai_tick = 0.0
-
+	_settler_decision_tick_counter += 1
+	var is_night: bool = _is_night()
 	var agents: PackedVector2Array = _agents.get_agent_positions()
-	var targets := PackedVector2Array()
-	targets.resize(agents.size())
-	var poi_idx: int = _current_poi_target_index()
-	var poi_target: Vector2 = Vector2.ZERO
-	var scout_idx: int = -1
-	if poi_idx >= 0 and poi_idx < _poi_sites.size():
-		var psite: Dictionary = _poi_sites[poi_idx]
-		poi_target = _tile_center(psite["tile"])
-		scout_idx = _select_poi_scout(agents, poi_target)
-
-	for i in agents.size():
-		var state_tag: String = ""
-		if _is_night():
-			targets[i] = _apply_weapon_clustering(i, _home_center_for_settler(i), agents)
-			state_tag = "night_home"
-			if String(_agent_last_state.get(i, "")) != state_tag:
-				_agent_last_state[i] = state_tag
-				_settler_resource_targets.erase(i)
-				_record_agent_action(i, "Returning to home")
-			continue
-
-		var pos: Vector2 = agents[i]
-		var tile := _world_to_tile(pos)
-		var job: int = _job_for_settler(i)
-		if i == scout_idx and poi_idx >= 0:
-			targets[i] = _apply_weapon_clustering(i, poi_target, agents)
-			state_tag = "day_explore"
-			_settler_resource_targets.erase(i)
-			if String(_agent_last_state.get(i, "")) != state_tag:
-				_agent_last_state[i] = state_tag
-				_record_agent_action(i, "Scouting point of interest")
-			continue
-
-		if job == JOB_FARM:
-			# Farmers seek food resource tiles; go home if none in range
-			var cached: Vector2i = _settler_resource_targets.get(i, Vector2i(-9999, -9999))
-			var need_new: bool = cached == Vector2i(-9999, -9999)
-			if not need_new:
-				var rt: int = _resource_type_at(cached)
-				var is_food: bool = rt == RES_APPLE or rt == RES_BERRY_BLUE or rt == RES_BERRY_RASP or rt == RES_BERRY_BLACK
-				if not is_food or _resource_left(cached, rt) <= 0.0:
-					need_new = true
-				elif _resource_left(cached, rt) < FOOD_MIN_HARVEST:
-					need_new = true
-				elif tile.distance_to(cached) <= 1.5:
-					need_new = true
-			if need_new:
-				cached = _nearest_food_tile(tile)
-				_settler_resource_targets[i] = cached
-			targets[i] = _apply_weapon_clustering(i, _tile_center(cached), agents)
-			state_tag = "day_farm"
-		elif job == JOB_HUNT:
-			var hunt_pos: Vector2 = _nearest_wildlife_pos(pos, true)
-			targets[i] = _apply_weapon_clustering(i, hunt_pos, agents)
-			state_tag = "day_hunt"
-		elif job == JOB_SCOUT:
-			targets[i] = _apply_weapon_clustering(i, poi_target if poi_idx >= 0 else _target, agents)
-			state_tag = "day_scout"
-		else:
-			var res_type: int = RES_TREE if job == JOB_LUMBER else RES_STONE
-			var cached: Vector2i = _settler_resource_targets.get(i, Vector2i(-9999, -9999))
-			var need_new: bool = false
-			if cached == Vector2i(-9999, -9999):
-				need_new = true
-			elif _resource_left(cached, res_type) <= 0.0:
-				need_new = true
-			elif tile.distance_to(cached) <= 1.5:
-				# Arrived — find next tile
-				need_new = true
-			if need_new:
-				cached = _nearest_resource_tile(tile, res_type)
-				_settler_resource_targets[i] = cached
-			targets[i] = _apply_weapon_clustering(i, _tile_center(cached), agents)
-			state_tag = "day_lumber" if job == JOB_LUMBER else "day_stone"
-
-		if String(_agent_last_state.get(i, "")) != state_tag:
-			_agent_last_state[i] = state_tag
-			if state_tag == "day_farm":
-				_record_agent_action(i, "Assigned to farming")
-			elif state_tag == "day_lumber":
-				_record_agent_action(i, "Assigned to lumber")
-			elif state_tag == "day_hunt":
-				_record_agent_action(i, "Assigned to hunting")
-			elif state_tag == "day_scout":
-				_record_agent_action(i, "Assigned to scouting")
-			else:
-				_record_agent_action(i, "Assigned to mining")
-
-	_agents.set_agent_targets(targets)
+	var count: int = agents.size()
+	if count <= 0:
+		_settler_decisions_this_tick = 0
+		return
+	_sync_settler_think_buffers(count)
+	var now_sec: float = Time.get_ticks_msec() * 0.001
+	var targets: PackedVector2Array = _agents.get_agent_targets()
+	if targets.size() != count:
+		targets.resize(count)
+		for i in count:
+			targets[i] = _target
+	var vp: Vector2 = get_viewport_rect().size
+	var z: Vector2 = _camera.zoom
+	var half: Vector2 = Vector2(vp.x * 0.5 / z.x, vp.y * 0.5 / z.y)
+	var cam: Vector2 = _camera.position
+	var view_min: Vector2 = cam - half
+	var view_max: Vector2 = cam + half
+	var result: Dictionary = _settler_decision_system.run({
+		"delta": delta,
+		"is_night": is_night,
+		"agents": agents,
+		"count": count,
+		"now_sec": now_sec,
+		"targets": targets,
+		"decision_budget": maxi(1, settler_decision_budget_per_tick),
+		"night_plan_budget": maxi(1, night_planning_budget_per_tick),
+		"offscreen_decision_throttle_enabled": offscreen_decision_throttle_enabled,
+		"offscreen_decision_stride": maxi(1, offscreen_decision_stride),
+		"offscreen_night_planning_stride": maxi(1, offscreen_night_planning_stride),
+		"decision_tick_counter": _settler_decision_tick_counter,
+		"view_min": view_min,
+		"view_max": view_max,
+		"settler_decision_cursor": _settler_decision_cursor,
+		"settler_decisions_this_tick": 0,
+		"invalid_tile": Vector2i(-9999, -9999),
+		"global_target": _target,
+		"camp_tile": _camp_tile,
+		"settler_next_think_time": _settler_next_think_time,
+		"settler_think_state": _settler_think_state,
+		"settler_idle_time": _settler_idle_time,
+		"settler_last_pos": _settler_last_pos,
+		"agent_last_state": _agent_last_state,
+		"settler_resource_targets": _settler_resource_targets,
+		"settler_day_plan_targets": _settler_day_plan_targets,
+		"settler_day_plan_job": _settler_day_plan_job,
+		"poi_sites": _poi_sites,
+		"think_executing": THINK_EXECUTING,
+		"think_thinking": THINK_THINKING,
+		"think_blocked": THINK_BLOCKED,
+		"job_farm": JOB_FARM,
+		"job_lumber": JOB_LUMBER,
+		"job_stone": JOB_STONE,
+		"job_hunt": JOB_HUNT,
+		"job_scout": JOB_SCOUT,
+		"res_apple": RES_APPLE,
+		"res_berry_blue": RES_BERRY_BLUE,
+		"res_berry_rasp": RES_BERRY_RASP,
+		"res_berry_black": RES_BERRY_BLACK,
+		"res_tree": RES_TREE,
+		"res_stone": RES_STONE,
+		"food_min_harvest": FOOD_MIN_HARVEST,
+		"settler_arrival_rethink_distance_px": settler_arrival_rethink_distance_px,
+		"settler_stuck_rethink_sec": settler_stuck_rethink_sec,
+		"settler_min_progress_px": settler_min_progress_px,
+		"cb_think_jitter": Callable(self, "_think_jitter"),
+		"cb_current_poi_target_index": Callable(self, "_current_poi_target_index"),
+		"cb_tile_center": Callable(self, "_tile_center"),
+		"cb_select_poi_scout": Callable(self, "_select_poi_scout"),
+		"cb_update_day_plan_for_settler": Callable(self, "_update_day_plan_for_settler"),
+		"cb_world_to_tile": Callable(self, "_world_to_tile"),
+		"cb_job_for_settler": Callable(self, "_job_for_settler"),
+		"cb_segment_world_target": Callable(self, "_segment_world_target"),
+		"cb_home_center_for_settler": Callable(self, "_home_center_for_settler"),
+		"cb_schedule_next_think": Callable(self, "_schedule_next_think"),
+		"cb_release_resource_claim": Callable(self, "_release_resource_claim"),
+		"cb_record_agent_action": Callable(self, "_record_agent_action"),
+		"cb_log_global_settler_event": Callable(self, "_log_global_settler_event"),
+		"cb_resource_type_at": Callable(self, "_resource_type_at"),
+		"cb_resource_left": Callable(self, "_resource_left"),
+		"cb_is_day_plan_valid": Callable(self, "_is_day_plan_valid"),
+		"cb_nearest_food_tile": Callable(self, "_nearest_food_tile"),
+		"cb_try_claim_resource_tile": Callable(self, "_try_claim_resource_tile"),
+		"cb_segment_target_toward": Callable(self, "_segment_target_toward"),
+		"cb_nearest_wildlife_pos": Callable(self, "_nearest_wildlife_pos"),
+		"cb_nearest_resource_tile": Callable(self, "_nearest_resource_tile"),
+	})
+	_settler_decisions_this_tick = int(result["settler_decisions_this_tick"])
+	_settler_decision_cursor = int(result["settler_decision_cursor"])
+	_settler_next_think_time = result["settler_next_think_time"]
+	_settler_think_state = result["settler_think_state"]
+	_settler_idle_time = result["settler_idle_time"]
+	_settler_last_pos = result["settler_last_pos"]
+	_agent_last_state = result["agent_last_state"]
+	_agents.set_agent_targets(result["targets"])
 
 
 func _on_viewport_resized() -> void:
@@ -3035,6 +3812,202 @@ func _on_viewport_resized() -> void:
 	if _upgrade_toggle != null:
 		_upgrade_toggle.position = Vector2(vp.x - 136.0, 10.0)
 	_position_hover_panel()
+	_position_performance_panel()
+	_sync_agent_render_bounds()
+
+
+func _sync_agent_render_bounds() -> void:
+	if _agents == null or _camera == null:
+		return
+	var vp: Vector2 = get_viewport_rect().size
+	if vp.x <= 0.0 or vp.y <= 0.0:
+		return
+	var z: Vector2 = _camera.zoom
+	var half: Vector2 = Vector2(vp.x * 0.5 / z.x, vp.y * 0.5 / z.y)
+	var cam: Vector2 = _camera.position
+	_agents.set_render_bounds(cam - half, cam + half)
+
+
+func _build_weapon_editor_ui() -> void:
+	if WEAPON_EDITOR_SCENE == null or _ui_layer == null:
+		return
+	_weapon_editor_panel = WEAPON_EDITOR_SCENE.instantiate() as WeaponEditorPanel
+	if _weapon_editor_panel == null:
+		return
+	_ui_layer.add_child(_weapon_editor_panel)
+	_weapon_editor_panel.save_requested.connect(_on_weapon_editor_save_requested)
+	_weapon_editor_panel.closed_requested.connect(func() -> void:
+		_record_agent_action(0, "Closed weapon editor")
+	)
+	_refresh_weapon_editor_records()
+
+
+func _toggle_weapon_editor() -> void:
+	if _weapon_editor_panel == null:
+		return
+	if not _weapon_editor_panel.visible:
+		_refresh_weapon_editor_records()
+	_weapon_editor_panel.visible = not _weapon_editor_panel.visible
+	if _weapon_editor_panel.visible:
+		_record_agent_action(0, "Opened weapon editor")
+
+
+func _refresh_weapon_editor_records() -> void:
+	if _weapon_editor_panel == null:
+		return
+	_weapon_editor_panel.set_weapon_records(_weapon_records_for_editor())
+
+
+func _weapon_records_for_editor() -> Array[Dictionary]:
+	var out: Array[Dictionary] = []
+	var ids: Array = _weapon_registry.keys()
+	ids.sort()
+	for idv in ids:
+		var weapon_id: int = int(idv)
+		var data: WeaponData = _weapon_registry.get(weapon_id, null)
+		if data == null:
+			continue
+		out.append({
+			"weapon_id": data.weapon_id,
+			"weapon_name": data.weapon_name,
+			"attack_kind": data.attack_kind,
+			"range": data.range,
+			"damage": data.damage,
+			"cooldown": data.cooldown,
+			"defense": data.defense,
+			"aoe_radius": data.aoe_radius,
+			"projectile_speed": data.projectile_speed,
+			"trail_color": data.trail_color,
+			"trail_width": data.trail_width,
+			"icon_path": "" if data.icon_texture == null else String(data.icon_texture.resource_path),
+			"projectile_path": "" if data.projectile_texture == null else String(data.projectile_texture.resource_path),
+			"sound_path": "" if data.attack_sound == null else String(data.attack_sound.resource_path),
+			"resource_path": String(data.resource_path),
+		})
+	return out
+
+
+func _on_weapon_editor_save_requested(record: Dictionary) -> void:
+	var wd := WeaponData.new()
+	wd.weapon_id = int(record.get("weapon_id", 0))
+	wd.weapon_name = String(record.get("weapon_name", "Weapon %d" % wd.weapon_id))
+	wd.attack_kind = int(record.get("attack_kind", WeaponData.AttackKind.MELEE))
+	wd.range = float(record.get("range", 34.0))
+	wd.damage = float(record.get("damage", 1.0))
+	wd.cooldown = float(record.get("cooldown", 1.4))
+	wd.defense = float(record.get("defense", 1.0))
+	wd.aoe_radius = float(record.get("aoe_radius", 0.0))
+	wd.projectile_speed = float(record.get("projectile_speed", 380.0))
+	wd.trail_color = record.get("trail_color", Color(0.82, 0.76, 0.42, 1.0))
+	wd.trail_width = float(record.get("trail_width", 2.2))
+
+	var icon_path: String = String(record.get("icon_path", "")).strip_edges()
+	if not icon_path.is_empty():
+		var icon: Texture2D = load(icon_path)
+		if icon != null:
+			wd.icon_texture = icon
+	var projectile_path: String = String(record.get("projectile_path", "")).strip_edges()
+	if not projectile_path.is_empty():
+		var projectile_tex: Texture2D = load(projectile_path)
+		if projectile_tex != null:
+			wd.projectile_texture = projectile_tex
+	var sound_path: String = String(record.get("sound_path", "")).strip_edges()
+	if not sound_path.is_empty():
+		var attack_sfx: AudioStream = load(sound_path)
+		if attack_sfx != null:
+			wd.attack_sound = attack_sfx
+
+	DirAccess.make_dir_recursive_absolute("user://weapons")
+	var save_path: String = "user://weapons/weapon_%d.tres" % wd.weapon_id
+	var err: int = ResourceSaver.save(wd, save_path)
+	if err != OK:
+		push_warning("Failed to save weapon resource %s (err %d)" % [save_path, err])
+		return
+
+	_load_weapon_registry()
+	_refresh_weapon_editor_records()
+	_rebalance_settler_weapons()
+	_record_agent_action(0, "Saved weapon %s" % wd.weapon_name)
+
+
+func _load_weapon_registry() -> void:
+	_weapon_registry.clear()
+	for wid in [WEAPON_SPEAR, WEAPON_SHIELD, WEAPON_BOW, WEAPON_JAVELIN]:
+		_register_weapon_data(_default_weapon_data(wid))
+	_load_weapon_dir("res://data/weapons")
+	_load_weapon_dir("user://weapons")
+
+
+func _load_weapon_dir(dir_path: String) -> void:
+	var dir: DirAccess = DirAccess.open(dir_path)
+	if dir == null:
+		return
+	dir.list_dir_begin()
+	while true:
+		var name: String = dir.get_next()
+		if name.is_empty():
+			break
+		if dir.current_is_dir():
+			continue
+		if not name.ends_with(".tres") and not name.ends_with(".res"):
+			continue
+		var res_path: String = "%s/%s" % [dir_path, name]
+		var wd: WeaponData = load(res_path)
+		if wd == null:
+			continue
+		_register_weapon_data(wd)
+	dir.list_dir_end()
+
+
+func _register_weapon_data(data: WeaponData) -> void:
+	if data == null:
+		return
+	_weapon_registry[data.weapon_id] = data
+
+
+func _default_weapon_data(weapon_id: int) -> WeaponData:
+	var d := WeaponData.new()
+	d.weapon_id = weapon_id
+	match weapon_id:
+		WEAPON_SHIELD:
+			d.weapon_name = "Shield"
+			d.attack_kind = WeaponData.AttackKind.MELEE
+			d.range = 26.0
+			d.damage = 0.85
+			d.cooldown = 1.05
+			d.defense = 1.45
+			d.trail_color = Color(0.5, 0.75, 0.95, 1.0)
+			d.trail_width = 2.4
+		WEAPON_BOW:
+			d.weapon_name = "Bow"
+			d.attack_kind = WeaponData.AttackKind.RANGED
+			d.range = 90.0
+			d.damage = 0.92
+			d.cooldown = 1.2
+			d.defense = 0.65
+			d.projectile_speed = 520.0
+			d.trail_color = Color(0.78, 0.62, 0.18, 1.0)
+			d.trail_width = 2.0
+		WEAPON_JAVELIN:
+			d.weapon_name = "Javelin"
+			d.attack_kind = WeaponData.AttackKind.RANGED
+			d.range = 66.0
+			d.damage = 1.25
+			d.cooldown = 1.55
+			d.defense = 0.78
+			d.projectile_speed = 430.0
+			d.trail_color = Color(0.9, 0.84, 0.55, 1.0)
+			d.trail_width = 2.6
+		_:
+			d.weapon_name = "Spear"
+			d.attack_kind = WeaponData.AttackKind.MELEE
+			d.range = 34.0
+			d.damage = 1.0
+			d.cooldown = 1.4
+			d.defense = 1.0
+			d.trail_color = Color(0.82, 0.76, 0.42, 1.0)
+			d.trail_width = 2.2
+	return d
 
 
 func _on_upgrade_pressed(item: Dictionary, buy_button: Button, rank_label: Label, cost_label: Label, row_panel: PanelContainer) -> void:
@@ -3312,24 +4285,14 @@ func _spend_cost(cost: Dictionary) -> void:
 
 
 func _resource_cost_icon(key: String) -> String:
-	match key:
-		"food":
-			return "F"
-		"lumber":
-			return "L"
-		"stone":
-			return "S"
-		"cobblestone":
-			return "C"
-		_:
-			return key.substr(0, 1).to_upper()
+	return _resource_icon(key)
 
 
 func _cost_to_string(cost: Dictionary) -> String:
 	var parts: Array[String] = []
 	for key in ["food", "lumber", "stone", "cobblestone"]:
 		if cost.has(key):
-			parts.append("[%s] %d" % [_resource_cost_icon(String(key)), int(cost[key])])
+			parts.append("%s %d" % [_resource_cost_icon(String(key)), int(cost[key])])
 	return "Cost: " + ", ".join(parts)
 
 
@@ -3427,7 +4390,10 @@ func _reveal_around_tile(center: Vector2i, radius: int) -> void:
 			if ox * ox + oy * oy > radius * radius:
 				continue
 			var t := Vector2i(center.x + ox, center.y + oy)
-			_explored[_tile_key(t)] = true
+			var key: String = _tile_key(t)
+			if not _explored.has(key):
+				_explored[key] = true
+				_mark_tile_dirty(t)
 
 
 func _add_watchtower_at_world(world_pos: Vector2) -> void:
@@ -3524,15 +4490,21 @@ func _resource_type_at(tile: Vector2i) -> int:
 
 func _resource_initial_amount(tile: Vector2i, res_type: int) -> float:
 	var r: float = _rand01(tile.x, tile.y, _world_seed + 991)
+	var durability_mult: float = maxf(1.0, resource_node_yield_mult) * _resource_distance_multiplier(tile)
 	if res_type == RES_TREE:
-		return 4.0 + floor(r * 7.0)
+		return (4.0 + floor(r * 7.0)) * durability_mult
 	if res_type == RES_STONE:
-		return 5.0 + floor(r * 9.0)
+		return (5.0 + floor(r * 9.0)) * durability_mult
 	if res_type == RES_APPLE:
-		return 3.0 + floor(r * 5.0)  # regrows — handled by slow respawn
+		return (3.0 + floor(r * 5.0)) * durability_mult  # regrows — handled by slow respawn
 	if res_type == RES_BERRY_BLUE or res_type == RES_BERRY_RASP or res_type == RES_BERRY_BLACK:
-		return 2.0 + floor(r * 4.0)
+		return (3.0 + floor(r * 5.0)) * durability_mult
 	return 0.0
+
+
+func _resource_distance_multiplier(tile: Vector2i) -> float:
+	var dist_tiles: float = float(tile.distance_to(_camp_tile))
+	return 1.0 + minf(3.0, dist_tiles / 35.0)
 
 
 func _resource_left(tile: Vector2i, res_type: int) -> float:
@@ -3543,7 +4515,27 @@ func _resource_left(tile: Vector2i, res_type: int) -> float:
 
 
 func _set_resource_left(tile: Vector2i, value: float) -> void:
-	_resource_remaining[_tile_key(tile)] = maxf(0.0, value)
+	var key: String = _tile_key(tile)
+	var clamped: float = maxf(0.0, value)
+	_resource_remaining[key] = clamped
+	if clamped <= 0.0 and _resource_claims.has(key):
+		var owner: int = int(_resource_claims[key])
+		if _settler_resource_targets.has(owner):
+			var owner_tile: Vector2i = _settler_resource_targets[owner]
+			if _tile_key(owner_tile) == key:
+				_settler_resource_targets.erase(owner)
+				_settler_day_plan_targets.erase(owner)
+				_settler_day_plan_job.erase(owner)
+		_resource_claims.erase(key)
+	if clamped <= 0.0:
+		var plan_keys: Array = _settler_day_plan_targets.keys()
+		for idx_v in plan_keys:
+			var idx: int = int(idx_v)
+			var planned_tile: Vector2i = _settler_day_plan_targets[idx]
+			if _tile_key(planned_tile) == key:
+				_settler_day_plan_targets.erase(idx)
+				_settler_day_plan_job.erase(idx)
+	_mark_tile_dirty(tile)
 
 
 func _rand01(x: int, y: int, seed: int) -> float:
@@ -3627,6 +4619,9 @@ func _update_collection_particles(delta: float) -> void:
 			_collect_particles.remove_at(i)
 		else:
 			_collect_particles[i] = p
+	if _collect_particles.is_empty():
+		_collect_particle_multimesh.instance_count = 0
+		_collect_particle_multimesh.visible_instance_count = 0
 
 
 func _kick_camera(amount: float) -> void:
@@ -3635,46 +4630,48 @@ func _kick_camera(amount: float) -> void:
 
 
 func _update_settler_combat(delta: float) -> void:
-	if _wildlife.is_empty():
+	var result: Dictionary = _combat_system.run({
+		"delta": delta,
+		"wildlife": _wildlife,
+		"attack_cooldowns": _settler_attack_cooldowns,
+		"hunter_attack_anims": _hunter_attack_anims,
+		"combat_sfx_events": [],
+		"settler_combat_damage_mult": _settler_combat_damage_mult,
+		"settler_attack_speed_mult": _settler_attack_speed_mult,
+		"melee_damage_mult": _melee_damage_mult,
+		"ranged_damage_mult": _ranged_damage_mult,
+		"animal_wolf": ANIMAL_WOLF,
+		"animal_bear": ANIMAL_BEAR,
+		"cb_is_night": Callable(self, "_is_night"),
+		"cb_agent_positions": Callable(_agents, "get_agent_positions"),
+		"cb_weapon_for_settler": Callable(self, "_weapon_for_settler"),
+		"cb_weapon_profile": Callable(self, "_weapon_profile"),
+		"cb_record_agent_action": Callable(self, "_record_agent_action"),
+		"cb_weapon_name_for_id": Callable(self, "_weapon_name_for_id"),
+	})
+	_settler_attack_cooldowns = result["attack_cooldowns"]
+	_hunter_attack_anims = result["hunter_attack_anims"]
+	var sfx_events: Array = result.get("combat_sfx_events", [])
+	for ev in sfx_events:
+		_play_combat_sfx_at(String(ev.get("path", "")), ev.get("pos", _target))
+
+
+func _play_combat_sfx_at(sound_path: String, world_pos: Vector2) -> void:
+	if sound_path.is_empty():
 		return
-	for i in _settler_attack_cooldowns.size():
-		_settler_attack_cooldowns[i] = maxf(0.0, _settler_attack_cooldowns[i] - delta)
-
-	var agents: PackedVector2Array = _agents.get_agent_positions()
-	for i in agents.size():
-		if _settler_attack_cooldowns[i] > 0.0:
-			continue
-		var from_pos: Vector2 = agents[i]
-		var weapon_id: int = _weapon_for_settler(i)
-		var profile: Dictionary = _weapon_profile(weapon_id)
-		var attack_range: float = float(profile["range"])
-		var nearest_idx: int = -1
-		var nearest_dist: float = 1e9
-		for wi in _wildlife.size():
-			var w: Dictionary = _wildlife[wi]
-			var typ: int = int(w["type"])
-			if typ != ANIMAL_WOLF and typ != ANIMAL_BEAR:
-				continue
-			if not _is_night():
-				continue
-			var d: float = from_pos.distance_to(w["pos"])
-			if d < nearest_dist:
-				nearest_dist = d
-				nearest_idx = wi
-		if nearest_idx < 0 or nearest_dist > attack_range:
-			continue
-
-		var target: Dictionary = _wildlife[nearest_idx]
-		var to_pos: Vector2 = target["pos"]
-		var ranged: bool = bool(profile["ranged"])
-		var role_mult: float = _ranged_damage_mult if ranged else _melee_damage_mult
-		var damage: float = 1.1 * float(profile["damage"]) * _settler_combat_damage_mult * role_mult
-		target["hp"] = float(target["hp"]) - damage
-		_wildlife[nearest_idx] = target
-		var anim_dur: float = 0.13 if ranged else 0.16
-		_hunter_attack_anims.append({"from": from_pos, "to": to_pos, "t": 0.0, "dur": anim_dur})
-		_settler_attack_cooldowns[i] = maxf(0.25, float(profile["cooldown"]) / _settler_attack_speed_mult)
-		_record_agent_action(i, "Defended with %s" % _weapon_name_for_id(weapon_id))
+	var stream: AudioStream = load(sound_path)
+	if stream == null:
+		return
+	var one_shot := AudioStreamPlayer2D.new()
+	one_shot.stream = stream
+	one_shot.global_position = world_pos
+	one_shot.volume_db = -8.0
+	one_shot.pitch_scale = _rng.randf_range(0.96, 1.04)
+	add_child(one_shot)
+	one_shot.finished.connect(func() -> void:
+		one_shot.queue_free()
+	)
+	one_shot.play()
 
 
 func _apply_predator_strike(strike_pos: Vector2, predator_type: int) -> void:
@@ -3801,126 +4798,33 @@ func _raze_nearest_structure(strike_pos: Vector2) -> bool:
 # ─── Wildlife ────────────────────────────────────────────────────────────────
 
 func _update_wildlife(delta: float) -> void:
-	_structure_raze_cooldown = maxf(0.0, _structure_raze_cooldown - delta)
-	_wildlife_spawn_tick += delta
-	if _is_night() and _wildlife_spawn_tick >= 6.0:
-		_wildlife_spawn_tick = 0.0
-		_try_spawn_wildlife()
-
-	var settler_positions: PackedVector2Array = _agents.get_agent_positions()
-
-	for wi in range(_wildlife.size()):
-		var w: Dictionary = _wildlife[wi]
-		var pos: Vector2 = w["pos"]
-		var vel := Vector2.ZERO
-		var typ: int = int(w["type"])
-		var state: String = String(w["state"])
-		w["attack_cd"] = maxf(0.0, float(w["attack_cd"]) - delta)
-
-		match typ:
-			ANIMAL_DEER:
-				# Flee if settler within 80px, otherwise wander
-				var flee_dir := _flee_direction(pos, settler_positions, 80.0)
-				if flee_dir.length_squared() > 0.01:
-					vel = flee_dir.normalized() * 28.0
-					w["state"] = "flee"
-				else:
-					vel = _wander(w, delta, 12.0)
-					w["state"] = "wander"
-
-			ANIMAL_WOLF:
-				# Wolves are aggressive and dynamic at night, weaving as they hunt.
-				var nearest_dist: float = 1e9
-				var nearest_pos := Vector2.ZERO
-				for sp in settler_positions:
-					var d: float = pos.distance_to(sp)
-					if d < nearest_dist:
-						nearest_dist = d
-						nearest_pos = sp
-				var chasing: bool = w["state"] == "chase" or w["state"] == "attack" or w["state"] == "raid_hunt"
-				var phase: float = float(w.get("phase", 0.0))
-				if not _is_night():
-					w["state"] = "wander"
-					w["chase_timer"] = 0.0
-					vel = _wander(w, delta, 16.0)
-				elif nearest_dist < 220.0 or _wolf_raid_active:
-					if not chasing:
-						w["chase_timer"] = 5.0
-					w["state"] = "raid_hunt" if nearest_dist > 22.0 else "attack"
-					var hunt_target: Vector2 = nearest_pos
-					if nearest_dist >= 220.0:
-						hunt_target = _tile_center(_camp_tile)
-						if _house_tiles.size() > 0:
-							hunt_target = _tile_center(_house_tiles[int(wi) % _house_tiles.size()])
-					w["target_pos"] = hunt_target
-					var toward: Vector2 = (hunt_target - pos)
-					var dir: Vector2 = toward.normalized() if toward.length_squared() > 0.001 else Vector2.RIGHT
-					var side := Vector2(-dir.y, dir.x)
-					var zig: float = sin(Time.get_ticks_msec() * 0.004 + phase)
-					vel = (dir + side * (0.34 * zig)).normalized() * 38.0
-					if nearest_dist < 22.0 and float(w["attack_cd"]) <= 0.0:
-						w["attack_cd"] = 1.8
-						_night_visual_boost = minf(0.2, _night_visual_boost + 0.03)
-						_apply_predator_strike(nearest_pos, ANIMAL_WOLF)
-						_try_raze_structure(nearest_pos, ANIMAL_WOLF)
-				elif chasing:
-					w["chase_timer"] = float(w.get("chase_timer", 0.0)) - delta
-					if float(w["chase_timer"]) > 0.0 and nearest_dist < 280.0:
-						var chase_dir: Vector2 = (nearest_pos - pos).normalized()
-						vel = chase_dir * 31.0
-					else:
-						w["state"] = "wander"
-						w["chase_timer"] = 0.0
-						vel = _wander(w, delta, 14.0)
-				else:
-					# Patrol toward village with jitter so they pressure from multiple angles.
-					var center2 := _tile_center(_camp_tile)
-					if _house_tiles.size() > 0:
-						center2 = _tile_center(_house_tiles[int(wi) % _house_tiles.size()])
-					var diff2: Vector2 = center2 - pos
-					var ddir: Vector2 = diff2.normalized() if diff2.length_squared() > 0.001 else Vector2.RIGHT
-					var side2 := Vector2(-ddir.y, ddir.x)
-					var wiggle: float = sin(Time.get_ticks_msec() * 0.003 + phase * 0.7)
-					vel = (ddir + side2 * 0.42 * wiggle).normalized() * 26.0
-					w["state"] = "wander"
-
-			ANIMAL_BEAR:
-				# Bears are heavy but aggressive at night and charge from fog edges.
-				var nearest_dist: float = 1e9
-				var nearest_pos := Vector2.ZERO
-				for sp in settler_positions:
-					var d: float = pos.distance_to(sp)
-					if d < nearest_dist:
-						nearest_dist = d
-						nearest_pos = sp
-				var phase_b: float = float(w.get("phase", 0.0))
-				if _is_night():
-					w["state"] = "aggro"
-					var bear_target: Vector2 = nearest_pos
-					if nearest_dist > 240.0:
-						bear_target = _tile_center(_camp_tile)
-					var bdir: Vector2 = (bear_target - pos).normalized()
-					var swing: float = sin(Time.get_ticks_msec() * 0.0025 + phase_b)
-					var bside := Vector2(-bdir.y, bdir.x)
-					vel = (bdir + bside * 0.22 * swing).normalized() * 34.0
-					if nearest_dist < 22.0 and float(w["attack_cd"]) <= 0.0:
-						w["attack_cd"] = 3.0
-						_apply_predator_strike(nearest_pos, ANIMAL_BEAR)
-						_try_raze_structure(nearest_pos, ANIMAL_BEAR)
-				else:
-					vel = _wander(w, delta, 8.0)
-					w["state"] = "wander"
-
-		w["pos"] = pos + vel * delta
-
-	# Remove dead wildlife
-	for wi in range(_wildlife.size() - 1, -1, -1):
-		if float(_wildlife[wi]["hp"]) <= 0.0:
-			var t: int = int(_wildlife[wi]["type"])
-			var gain: float = _wildlife_food_yield(t)
-			_resources["food"] += gain
-			_spawn_floating_text(_wildlife[wi]["pos"], "+%d food" % int(gain), Color(0.95, 0.8, 0.34, 1.0))
-			_wildlife.remove_at(wi)
+	var result: Dictionary = _wildlife_system.run({
+		"delta": delta,
+		"structure_raze_cooldown": _structure_raze_cooldown,
+		"wildlife_spawn_tick": _wildlife_spawn_tick,
+		"night_visual_boost": _night_visual_boost,
+		"wolf_raid_active": _wolf_raid_active,
+		"camp_tile": _camp_tile,
+		"wildlife": _wildlife,
+		"resources": _resources,
+		"house_tiles": _house_tiles,
+		"animal_deer": ANIMAL_DEER,
+		"animal_wolf": ANIMAL_WOLF,
+		"animal_bear": ANIMAL_BEAR,
+		"cb_is_night": Callable(self, "_is_night"),
+		"cb_try_spawn_wildlife": Callable(self, "_try_spawn_wildlife"),
+		"cb_agent_positions": Callable(_agents, "get_agent_positions"),
+		"cb_flee_direction": Callable(self, "_flee_direction"),
+		"cb_wander": Callable(self, "_wander"),
+		"cb_tile_center": Callable(self, "_tile_center"),
+		"cb_apply_predator_strike": Callable(self, "_apply_predator_strike"),
+		"cb_try_raze_structure": Callable(self, "_try_raze_structure"),
+		"cb_wildlife_food_yield": Callable(self, "_wildlife_food_yield"),
+		"cb_spawn_floating_text": Callable(self, "_spawn_floating_text"),
+	})
+	_structure_raze_cooldown = float(result["structure_raze_cooldown"])
+	_wildlife_spawn_tick = float(result["wildlife_spawn_tick"])
+	_night_visual_boost = float(result["night_visual_boost"])
 
 
 func _try_spawn_wildlife() -> void:
@@ -4141,10 +5045,12 @@ func _draw_hunter_anims() -> void:
 		var p: float = clampf(float(anim["t"]) / float(anim["dur"]), 0.0, 1.0)
 		var alpha: float = 1.0 - p
 		var tip: Vector2 = (anim["from"] as Vector2).lerp(anim["to"], minf(p * 2.5, 1.0))
-		# Brown spear line
-		draw_line(anim["from"], tip, Color(0.55, 0.35, 0.12, alpha), 2.2)
+		var base_col: Color = anim.get("color", Color(0.82, 0.76, 0.42, 1.0))
+		var line_col: Color = Color(base_col.r, base_col.g, base_col.b, alpha)
+		var width: float = float(anim.get("width", 2.2))
+		draw_line(anim["from"], tip, line_col, width)
 		# Spear tip
-		draw_circle(tip, 2.0, Color(0.82, 0.76, 0.42, alpha))
+		draw_circle(tip, maxf(1.6, width * 0.9), line_col)
 
 
 func _update_camera_kick(delta: float) -> void:

@@ -9,12 +9,23 @@ var _results: Array[Dictionary] = []
 var _last_run_ms: int = 0
 
 
-func run_suite(suite: McpTestSuite, test_filter: String = "") -> void:
+func run_suite(suite: McpTestSuite, test_filter: String = "", exclude_test_filter: String = "") -> void:
 	var name := suite.suite_name()
 	var methods := _get_test_methods(suite)
+	var exclusions := _parse_exclusions(exclude_test_filter)
 
 	for method_name in methods:
 		if not test_filter.is_empty() and method_name.find(test_filter) == -1:
+			continue
+		if _matches_any_exclusion(method_name, exclusions):
+			_results.append({
+				"suite": name,
+				"test": method_name,
+				"passed": true,
+				"skipped": true,
+				"message": "Excluded by exclude_test_name filter",
+				"assertion_count": 0,
+			})
 			continue
 
 		suite._reset()
@@ -60,7 +71,7 @@ func run_suite(suite: McpTestSuite, test_filter: String = "") -> void:
 		})
 
 
-func run_suites(suites: Array, suite_filter: String = "", test_filter: String = "", ctx: Dictionary = {}, verbose: bool = false) -> Dictionary:
+func run_suites(suites: Array, suite_filter: String = "", test_filter: String = "", ctx: Dictionary = {}, verbose: bool = false, exclude_test_filter: String = "") -> Dictionary:
 	_results.clear()
 	var start := Time.get_ticks_msec()
 
@@ -98,7 +109,7 @@ func run_suites(suites: Array, suite_filter: String = "", test_filter: String = 
 				"assertion_count": 0,
 			})
 		else:
-			run_suite(suite, test_filter)
+			run_suite(suite, test_filter, exclude_test_filter)
 		suite.suite_teardown()
 
 		## Remove any nodes the suite left behind (failed undo, missing cleanup).
@@ -199,3 +210,26 @@ func _free_mcp_test_nodes_recursive(root: Node) -> void:
 		if v.get_parent() != null:
 			v.get_parent().remove_child(v)
 		v.queue_free()
+
+
+## Split the `exclude_test_name` filter into individual substring matchers.
+## Comma-separated so the CI smoke harness can list multiple flaky tests
+## without shipping a richer schema (single names still work — same string,
+## no comma, same one-element list). Whitespace around each name is stripped
+## so `"a, b"` and `"a,b"` behave identically.
+static func _parse_exclusions(filter: String) -> Array[String]:
+	var out: Array[String] = []
+	if filter.is_empty():
+		return out
+	for part in filter.split(","):
+		var trimmed := part.strip_edges()
+		if not trimmed.is_empty():
+			out.append(trimmed)
+	return out
+
+
+static func _matches_any_exclusion(method_name: String, exclusions: Array[String]) -> bool:
+	for ex in exclusions:
+		if method_name.find(ex) != -1:
+			return true
+	return false

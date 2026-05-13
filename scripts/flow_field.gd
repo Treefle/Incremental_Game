@@ -15,11 +15,17 @@ extends RefCounted
 var width:     int
 var height:    int
 var cell_size: int
+var cache_max_entries: int = 64
 
 ## Direction per cell pointing toward the target (cardinal grid units, normalized).
 var vectors: PackedVector2Array
 
 var _cost: PackedFloat32Array
+var _cache_vectors: Dictionary = {}
+var _cache_order: Array[String] = []
+var _walkable_revision: int = 0
+var _cache_hits: int = 0
+var _cache_misses: int = 0
 
 
 ## Call once to size internal arrays.
@@ -29,6 +35,29 @@ func setup(w: int, h: int, cs: int) -> void:
 	cell_size = cs
 	vectors.resize(w * h)
 	_cost.resize(w * h)
+	_clear_cache()
+
+
+func set_cache_capacity(capacity: int) -> void:
+	cache_max_entries = maxi(1, capacity)
+	while _cache_order.size() > cache_max_entries:
+		var oldest: String = _cache_order[0]
+		_cache_order.remove_at(0)
+		_cache_vectors.erase(oldest)
+
+
+func notify_walkable_changed() -> void:
+	_walkable_revision += 1
+	_clear_cache()
+
+
+func get_cache_stats() -> Dictionary:
+	return {
+		"hits": _cache_hits,
+		"misses": _cache_misses,
+		"entries": _cache_order.size(),
+		"revision": _walkable_revision,
+	}
 
 
 ## Recompute flow field from a world-space target position.
@@ -36,7 +65,21 @@ func setup(w: int, h: int, cs: int) -> void:
 func compute(target_world: Vector2, walkable: PackedByteArray) -> void:
 	var tx := clampi(int(target_world.x / cell_size), 0, width - 1)
 	var ty := clampi(int(target_world.y / cell_size), 0, height - 1)
+	var key: String = "%d:%d:%d" % [_walkable_revision, tx, ty]
+	if _cache_vectors.has(key):
+		_cache_hits += 1
+		_touch_cache_key(key)
+		vectors = _cache_vectors[key]
+		return
+
+	_cache_misses += 1
 	_bfs(ty * width + tx, walkable)
+	_cache_vectors[key] = vectors.duplicate()
+	_touch_cache_key(key)
+	if _cache_order.size() > cache_max_entries:
+		var oldest: String = _cache_order[0]
+		_cache_order.remove_at(0)
+		_cache_vectors.erase(oldest)
 
 
 ## BFS (uniform cost = 1 per cardinal step) from target outward.
@@ -123,3 +166,15 @@ func _cell(x: int, y: int) -> Vector2:
 	if x < 0 or x >= width or y < 0 or y >= height:
 		return Vector2.ZERO
 	return vectors[y * width + x]
+
+
+func _touch_cache_key(key: String) -> void:
+	var existing_idx: int = _cache_order.find(key)
+	if existing_idx >= 0:
+		_cache_order.remove_at(existing_idx)
+	_cache_order.append(key)
+
+
+func _clear_cache() -> void:
+	_cache_vectors.clear()
+	_cache_order.clear()
