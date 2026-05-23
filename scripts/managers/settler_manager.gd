@@ -5,6 +5,7 @@ var happiness: PackedFloat32Array
 var attack_cooldowns: PackedFloat32Array
 var weapons: PackedInt32Array
 var tools: PackedInt32Array
+var tool_modes: PackedInt32Array
 var next_think_time: PackedFloat32Array
 var think_state: PackedInt32Array
 var last_pos: PackedVector2Array
@@ -15,7 +16,8 @@ func ensure_core_buffers(
 	count: int,
 	rng: RandomNumberGenerator,
 	default_weapon: int,
-	default_tool: int
+	default_tool: int,
+	default_tool_mode: int
 ) -> void:
 	if happiness.size() != count:
 		var old_happiness := happiness
@@ -43,6 +45,12 @@ func ensure_core_buffers(
 		tools.resize(count)
 		for i in count:
 			tools[i] = old_tools[i] if i < old_tools.size() else default_tool
+
+	if tool_modes.size() != count:
+		var old_tool_modes := tool_modes
+		tool_modes.resize(count)
+		for i in count:
+			tool_modes[i] = old_tool_modes[i] if i < old_tool_modes.size() else default_tool_mode
 
 
 func ensure_think_buffers(

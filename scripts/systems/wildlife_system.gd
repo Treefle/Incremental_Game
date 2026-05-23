@@ -29,11 +29,35 @@ func run(state: Dictionary) -> Dictionary:
 	var cb_wildlife_food_yield: Callable = state["cb_wildlife_food_yield"]
 	var cb_spawn_floating_text: Callable = state["cb_spawn_floating_text"]
 
+	var deer_count: int = 0
+	var predator_positions := PackedVector2Array()
+	var herd_stats: Dictionary = {}
+	for w0 in wildlife:
+		var typ0: int = int(w0["type"])
+		if typ0 == animal_deer:
+			deer_count += 1
+			var herd_id: int = int(w0.get("herd_id", -1))
+			if herd_id >= 0:
+				if not herd_stats.has(herd_id):
+					herd_stats[herd_id] = {"sum_pos": Vector2.ZERO, "sum_vel": Vector2.ZERO, "count": 0}
+				var stat: Dictionary = herd_stats[herd_id]
+				stat["sum_pos"] = Vector2(stat["sum_pos"]) + Vector2(w0["pos"])
+				stat["sum_vel"] = Vector2(stat["sum_vel"]) + Vector2(w0.get("vel", Vector2.ZERO))
+				stat["count"] = int(stat["count"]) + 1
+				herd_stats[herd_id] = stat
+		elif typ0 == animal_wolf or typ0 == animal_bear:
+			predator_positions.append(Vector2(w0["pos"]))
+
 	structure_raze_cooldown = maxf(0.0, structure_raze_cooldown - delta)
 	wildlife_spawn_tick += delta
 	if bool(cb_is_night.call()) and wildlife_spawn_tick >= 6.0:
 		wildlife_spawn_tick = 0.0
-		cb_try_spawn_wildlife.call()
+		cb_try_spawn_wildlife.call(false, 1)
+	elif not bool(cb_is_night.call()) and wildlife_spawn_tick >= 3.5:
+		wildlife_spawn_tick = 0.0
+		if deer_count < 14:
+			var group_size: int = clampi(2 + int((14 - deer_count) / 4), 2, 5)
+			cb_try_spawn_wildlife.call(true, group_size)
 
 	var settler_positions: PackedVector2Array = cb_agent_positions.call()
 
@@ -47,13 +71,31 @@ func run(state: Dictionary) -> Dictionary:
 
 		match typ:
 			animal_deer:
-				var flee_dir: Vector2 = cb_flee_direction.call(pos, settler_positions, 80.0)
+				var flee_settler: Vector2 = cb_flee_direction.call(pos, settler_positions, 110.0)
+				var flee_predator: Vector2 = cb_flee_direction.call(pos, predator_positions, 95.0)
+				var flee_dir: Vector2 = flee_settler + flee_predator * 1.25
+				var herd_center := pos
+				var herd_vel := Vector2.ZERO
+				var herd_id: int = int(w.get("herd_id", -1))
+				if herd_id >= 0 and herd_stats.has(herd_id):
+					var hs: Dictionary = herd_stats[herd_id]
+					var count_h: int = maxi(1, int(hs["count"]))
+					herd_center = Vector2(hs["sum_pos"]) / float(count_h)
+					herd_vel = Vector2(hs["sum_vel"]) / float(count_h)
+				var cohesion: Vector2 = herd_center - pos
 				if flee_dir.length_squared() > 0.01:
-					vel = flee_dir.normalized() * 28.0
+					var flee_vec: Vector2 = flee_dir.normalized() * 42.0
+					if cohesion.length_squared() > 4.0:
+						flee_vec += cohesion.normalized() * 8.0
+					vel = flee_vec.limit_length(44.0)
 					w["state"] = "flee"
 				else:
-					vel = cb_wander.call(w, delta, 12.0)
-					w["state"] = "wander"
+					var herd_move: Vector2 = cb_wander.call(w, delta, 14.0)
+					if cohesion.length() > 18.0:
+						herd_move += cohesion.normalized() * 12.0
+					herd_move += herd_vel * 0.25
+					vel = herd_move.limit_length(22.0)
+					w["state"] = "herd"
 
 			animal_wolf:
 				var nearest_dist: float = 1e9

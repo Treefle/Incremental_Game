@@ -51,10 +51,13 @@ const DEFAULT_WATCHTOWER_RADIUS: int = 7
 @export var cull_offscreen_render: bool = true
 ## Extra margin around the camera rectangle so pop-in is less noticeable.
 @export_range(0.0, 512.0, 1.0) var render_cull_margin_px: float = 96.0
+@export var render_via_external_batch: bool = false
 
 ## Read-only: flat arrays of agent state (public for external systems to read).
 var positions:  PackedVector2Array
 var velocities: PackedVector2Array
+var _speed_multipliers: PackedFloat32Array
+var _agent_colors: PackedColorArray
 var _agent_targets: PackedVector2Array
 var _noise_phase: PackedFloat32Array
 var _noise_rate: PackedFloat32Array
@@ -164,11 +167,12 @@ func _build_multimesh() -> void:
 	mat.albedo_color  = Color(0.35, 0.9, 1.0)   # bright cyan for clarity
 	mat.shading_mode  = BaseMaterial3D.SHADING_MODE_UNSHADED
 	mat.cull_mode     = BaseMaterial3D.CULL_DISABLED
+	mat.vertex_color_use_as_albedo = true
 	mesh.material     = mat
 
 	var mm := MultiMesh.new()
 	mm.transform_format = MultiMesh.TRANSFORM_2D
-	mm.use_colors       = false
+	mm.use_colors       = true
 	mm.use_custom_data  = false
 	mm.mesh             = mesh
 	mm.instance_count   = agent_count
@@ -176,6 +180,7 @@ func _build_multimesh() -> void:
 
 	_mmi            = MultiMeshInstance2D.new()
 	_mmi.multimesh  = mm
+	_mmi.visible = not render_via_external_batch
 	add_child(_mmi)
 
 
@@ -189,6 +194,8 @@ func _spawn_agents() -> void:
 
 	positions.resize(agent_count)
 	velocities.resize(agent_count)
+	_speed_multipliers.resize(agent_count)
+	_agent_colors.resize(agent_count)
 	_noise_phase.resize(agent_count)
 	_noise_rate.resize(agent_count)
 	_visual_dir.resize(agent_count)
@@ -224,12 +231,15 @@ func _spawn_agents() -> void:
 					break
 		positions[i]  = pos
 		velocities[i] = Vector2.ZERO
+		_speed_multipliers[i] = 1.0
+		_agent_colors[i] = Color(0.35, 0.9, 1.0, 1.0)
 		_reveal_around(pos, _agent_reveal_radius)
 		_noise_phase[i] = rng.randf() * TAU
 		_noise_rate[i] = rng.randf_range(0.6, 1.5)
 		var jitter_angle: float = rng.randf() * TAU
 		_visual_dir[i] = Vector2(cos(jitter_angle), sin(jitter_angle))
 		_mmi.multimesh.set_instance_transform_2d(i, Transform2D(0.0, pos))
+		_mmi.multimesh.set_instance_color(i, _agent_colors[i])
 
 		# Buffer is fully refreshed in _flush_render each frame.
 
@@ -239,7 +249,10 @@ func _spawn_agents() -> void:
 func _process(delta: float) -> void:
 	if infinite_mode:
 		_step_infinite(delta)
-		_flush_render_infinite()
+		if render_via_external_batch:
+			_mmi.multimesh.visible_instance_count = 0
+		else:
+			_flush_render_infinite()
 		return
 
 	if _flow_dirty:
@@ -248,7 +261,10 @@ func _process(delta: float) -> void:
 			_apply_pending_flow_target()
 
 	_step(delta)
-	_flush_render()
+	if render_via_external_batch:
+		_mmi.multimesh.visible_instance_count = 0
+	else:
+		_flush_render()
 
 
 func _step(delta: float) -> void:
@@ -256,6 +272,9 @@ func _step(delta: float) -> void:
 	var t: float = Time.get_ticks_msec() * 0.001
 	var next_counts := _tile_counts.duplicate()
 	for i in agent_count:
+		var speed_mult: float = 1.0
+		if _speed_multipliers.size() == agent_count:
+			speed_mult = maxf(0.0, _speed_multipliers[i])
 		var pos: Vector2 = positions[i]
 		var dir: Vector2 = _flow.sample(pos)
 		var vel := Vector2.ZERO
@@ -281,7 +300,7 @@ func _step(delta: float) -> void:
 				var phase: float = _noise_phase[i] + t * _noise_rate[i]
 				var noise_dir := Vector2(cos(phase), sin(phase))
 				base_dir = (base_dir + noise_dir * direction_noise).normalized()
-			vel = base_dir * spd
+			vel = base_dir * (spd * speed_mult)
 
 		var proposed: Vector2 = pos + vel * delta
 		var from_idx: int = _cell_index_from_world(pos)
@@ -314,6 +333,8 @@ func _flush_render() -> void:
 			if draw_pos.x < _render_bounds_min.x or draw_pos.x > _render_bounds_max.x or draw_pos.y < _render_bounds_min.y or draw_pos.y > _render_bounds_max.y:
 				continue
 		_mmi.multimesh.set_instance_transform_2d(write_i, Transform2D(0.0, draw_pos))
+		var color: Color = _agent_colors[i] if i < _agent_colors.size() else Color(0.35, 0.9, 1.0, 1.0)
+		_mmi.multimesh.set_instance_color(write_i, color)
 		write_i += 1
 	_mmi.multimesh.visible_instance_count = write_i
 
@@ -350,6 +371,28 @@ func set_agent_target(index: int, world_pos: Vector2) -> void:
 	_agent_targets[index] = world_pos
 
 
+func set_agent_speed_multiplier(index: int, value: float) -> void:
+	if index < 0 or index >= agent_count:
+		return
+	if _speed_multipliers.size() != agent_count:
+		_speed_multipliers.resize(agent_count)
+		for i in agent_count:
+			_speed_multipliers[i] = 1.0
+	_speed_multipliers[index] = maxf(0.0, value)
+
+
+func set_agent_speed_multipliers(values: PackedFloat32Array) -> void:
+	if values.size() != agent_count:
+		return
+	_speed_multipliers = values
+
+
+func set_agent_colors(values: PackedColorArray) -> void:
+	if values.size() != agent_count:
+		return
+	_agent_colors = values
+
+
 func set_agent_targets(targets: PackedVector2Array) -> void:
 	if targets.size() != agent_count:
 		return
@@ -365,6 +408,8 @@ func add_agents(count: int, spawn_center: Vector2 = Vector2.ZERO) -> void:
 
 	positions.resize(agent_count)
 	velocities.resize(agent_count)
+	_speed_multipliers.resize(agent_count)
+	_agent_colors.resize(agent_count)
 	_noise_phase.resize(agent_count)
 	_noise_rate.resize(agent_count)
 	_visual_dir.resize(agent_count)
@@ -382,6 +427,8 @@ func add_agents(count: int, spawn_center: Vector2 = Vector2.ZERO) -> void:
 		)
 		positions[i] = pos
 		velocities[i] = Vector2.ZERO
+		_speed_multipliers[i] = 1.0
+		_agent_colors[i] = Color(0.35, 0.9, 1.0, 1.0)
 		_agent_targets[i] = _target_world
 		_noise_phase[i] = rng.randf() * TAU
 		_noise_rate[i] = rng.randf_range(0.6, 1.5)
@@ -494,6 +541,8 @@ func _tile_center_world(tile: Vector2i) -> Vector2:
 func _spawn_agents_infinite() -> void:
 	positions.resize(agent_count)
 	velocities.resize(agent_count)
+	_speed_multipliers.resize(agent_count)
+	_agent_colors.resize(agent_count)
 	_agent_targets.resize(agent_count)
 	_noise_phase.resize(agent_count)
 	_noise_rate.resize(agent_count)
@@ -508,6 +557,8 @@ func _spawn_agents_infinite() -> void:
 		)
 		positions[i] = pos
 		velocities[i] = Vector2.ZERO
+		_speed_multipliers[i] = 1.0
+		_agent_colors[i] = Color(0.35, 0.9, 1.0, 1.0)
 		_agent_targets[i] = _target_world
 		_noise_phase[i] = rng.randf() * TAU
 		_noise_rate[i] = rng.randf_range(0.6, 1.5)
@@ -521,6 +572,9 @@ func _step_infinite(delta: float) -> void:
 	var spd: float = tiles_per_second * float(CELL_SIZE)
 	var t: float = Time.get_ticks_msec() * 0.001
 	for i in agent_count:
+		var speed_mult: float = 1.0
+		if _speed_multipliers.size() == agent_count:
+			speed_mult = maxf(0.0, _speed_multipliers[i])
 		var pos: Vector2 = positions[i]
 		var target: Vector2 = _target_world
 		if _agent_targets.size() == agent_count:
@@ -535,7 +589,7 @@ func _step_infinite(delta: float) -> void:
 				var phase: float = _noise_phase[i] + t * _noise_rate[i]
 				var noise_dir := Vector2(cos(phase), sin(phase))
 				base_dir = (base_dir + noise_dir * direction_noise * 0.5).normalized()
-			vel = base_dir * spd
+			vel = base_dir * (spd * speed_mult)
 
 		velocities[i] = vel
 		positions[i] = pos + vel * delta
@@ -549,6 +603,8 @@ func _flush_render_infinite() -> void:
 			if draw_pos.x < _render_bounds_min.x or draw_pos.x > _render_bounds_max.x or draw_pos.y < _render_bounds_min.y or draw_pos.y > _render_bounds_max.y:
 				continue
 		_mmi.multimesh.set_instance_transform_2d(write_i, Transform2D(0.0, draw_pos))
+		var color: Color = _agent_colors[i] if i < _agent_colors.size() else Color(0.35, 0.9, 1.0, 1.0)
+		_mmi.multimesh.set_instance_color(write_i, color)
 		write_i += 1
 	_mmi.multimesh.visible_instance_count = write_i
 
@@ -561,6 +617,45 @@ func set_render_bounds(view_min: Vector2, view_max: Vector2) -> void:
 
 func clear_render_bounds() -> void:
 	_render_bounds_enabled = false
+
+
+func set_external_batch_render_enabled(enabled: bool) -> void:
+	render_via_external_batch = enabled
+	if _mmi != null:
+		_mmi.visible = not enabled
+		if enabled:
+			_mmi.multimesh.visible_instance_count = 0
+
+
+func append_agents_to_sprite_batch(batch_system: RenderBatchSystem, sprite_size_px: float = -1.0, _sprite_id: int = 0) -> void:
+	if batch_system == null:
+		return
+	var size_px: float = sprite_size_px if sprite_size_px > 0.0 else agent_size_px
+	if size_px <= 0.01 or agent_count <= 0:
+		return
+	if infinite_mode:
+		for i in agent_count:
+			var draw_pos: Vector2 = positions[i] + _visual_dir[i] * visual_jitter_px
+			if cull_offscreen_render and _render_bounds_enabled:
+				if draw_pos.x < _render_bounds_min.x or draw_pos.x > _render_bounds_max.x or draw_pos.y < _render_bounds_min.y or draw_pos.y > _render_bounds_max.y:
+					continue
+			var color: Color = _agent_colors[i] if i < _agent_colors.size() else Color(0.35, 0.9, 1.0, 1.0)
+			batch_system.append_sprite(draw_pos, size_px, color)
+		return
+
+	if _render_tile_counts.size() != _tile_counts.size():
+		_render_tile_counts.resize(_tile_counts.size())
+	_render_tile_counts.fill(0)
+	for i in agent_count:
+		var idx: int = _cell_index_from_world(positions[i])
+		var slot: int = mini(_render_tile_counts[idx], TILE_CAPACITY - 1)
+		_render_tile_counts[idx] += 1
+		var draw_pos: Vector2 = positions[i] + _slot_offsets[slot] + _visual_dir[i] * visual_jitter_px
+		if cull_offscreen_render and _render_bounds_enabled:
+			if draw_pos.x < _render_bounds_min.x or draw_pos.x > _render_bounds_max.x or draw_pos.y < _render_bounds_min.y or draw_pos.y > _render_bounds_max.y:
+				continue
+		var color: Color = _agent_colors[i] if i < _agent_colors.size() else Color(0.35, 0.9, 1.0, 1.0)
+		batch_system.append_sprite(draw_pos, size_px, color)
 
 
 func _apply_pending_flow_target() -> void:

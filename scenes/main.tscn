@@ -5,6 +5,7 @@
 
 [node name="Main" type="Node2D" unique_id=732674704]
 script = ExtResource("1_0wfyh")
+run_10k_settler_stress_test = false
 
 [node name="AgentSystem" type="Node2D" parent="." unique_id=1905393398]
 script = ExtResource("2_sugp2")

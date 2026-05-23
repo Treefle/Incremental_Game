@@ -11,6 +11,9 @@ func run(state: Dictionary) -> Dictionary:
 	var targets: PackedVector2Array = state["targets"]
 	var decision_budget: int = int(state["decision_budget"])
 	var night_plan_budget: int = int(state["night_plan_budget"])
+	var scan_budget: int = maxi(1, int(state.get("scan_budget", count)))
+	var candidate_indices: PackedInt32Array = state.get("candidate_indices", PackedInt32Array())
+	var monitor_advance: int = int(state.get("monitor_advance", 0))
 	var offscreen_decision_throttle_enabled: bool = bool(state.get("offscreen_decision_throttle_enabled", false))
 	var offscreen_decision_stride: int = maxi(1, int(state.get("offscreen_decision_stride", 1)))
 	var offscreen_night_planning_stride: int = maxi(1, int(state.get("offscreen_night_planning_stride", 1)))
@@ -47,6 +50,8 @@ func run(state: Dictionary) -> Dictionary:
 	var res_berry_black: int = int(state["res_berry_black"])
 	var res_tree: int = int(state["res_tree"])
 	var res_stone: int = int(state["res_stone"])
+	var res_metal: int = int(state.get("res_metal", -9999))
+	var metal_mining_unlocked: bool = bool(state.get("metal_mining_unlocked", false))
 	var food_min_harvest: float = float(state["food_min_harvest"])
 
 	var settler_arrival_rethink_distance_px: float = float(state["settler_arrival_rethink_distance_px"])
@@ -63,6 +68,7 @@ func run(state: Dictionary) -> Dictionary:
 	var cb_segment_world_target: Callable = state["cb_segment_world_target"]
 	var cb_home_center_for_settler: Callable = state["cb_home_center_for_settler"]
 	var cb_schedule_next_think: Callable = state["cb_schedule_next_think"]
+	var cb_set_next_think_time: Callable = state.get("cb_set_next_think_time", Callable())
 	var cb_release_resource_claim: Callable = state["cb_release_resource_claim"]
 	var cb_record_agent_action: Callable = state["cb_record_agent_action"]
 	var cb_log_global_settler_event: Callable = state["cb_log_global_settler_event"]
@@ -74,6 +80,8 @@ func run(state: Dictionary) -> Dictionary:
 	var cb_segment_target_toward: Callable = state["cb_segment_target_toward"]
 	var cb_nearest_wildlife_pos: Callable = state["cb_nearest_wildlife_pos"]
 	var cb_nearest_resource_tile: Callable = state["cb_nearest_resource_tile"]
+	var cb_nearest_mining_tile: Callable = state.get("cb_nearest_mining_tile", Callable())
+	var indicator_changed: PackedInt32Array = PackedInt32Array()
 
 	var poi_idx: int = -1
 	var poi_target: Vector2 = Vector2.ZERO
@@ -85,14 +93,18 @@ func run(state: Dictionary) -> Dictionary:
 			poi_target = cb_tile_center.call(psite["tile"])
 			scout_idx = int(cb_select_poi_scout.call(agents, poi_target))
 
-	for step in count:
-		var i: int = (settler_decision_cursor + step) % count
+	var processed_steps: int = candidate_indices.size() if not candidate_indices.is_empty() else mini(count, scan_budget)
+	for step in processed_steps:
+		var i: int = int(candidate_indices[step]) if not candidate_indices.is_empty() else (settler_decision_cursor + step) % count
+		var prev_think_state: int = settler_think_state[i]
 		var state_tag: String = ""
 		var pos_now: Vector2 = agents[i]
 		var is_visible: bool = pos_now.x >= view_min.x and pos_now.x <= view_max.x and pos_now.y >= view_min.y and pos_now.y <= view_max.y
 		if offscreen_decision_throttle_enabled and not is_visible:
 			var stride: int = offscreen_night_planning_stride if is_night else offscreen_decision_stride
 			if stride > 1 and ((i + decision_tick_counter) % stride) != 0:
+				if settler_think_state[i] != prev_think_state:
+					indicator_changed.append(i)
 				continue
 		if is_night:
 			if night_plan_budget > 0:
@@ -103,6 +115,8 @@ func run(state: Dictionary) -> Dictionary:
 					settler_think_state[i] = think_executing
 				settler_idle_time[i] = 0.0
 				settler_last_pos[i] = pos_now
+				if settler_think_state[i] != prev_think_state:
+					indicator_changed.append(i)
 				continue
 			var night_from_tile: Vector2i = cb_world_to_tile.call(pos_now)
 			targets[i] = cb_segment_world_target.call(night_from_tile, cb_home_center_for_settler.call(i))
@@ -117,6 +131,8 @@ func run(state: Dictionary) -> Dictionary:
 				cb_release_resource_claim.call(i)
 				cb_record_agent_action.call(i, "Returning to home")
 				cb_log_global_settler_event.call("state_change", i, cb_job_for_settler.call(i), state_tag, targets[i], "night_return_home")
+			if settler_think_state[i] != prev_think_state:
+				indicator_changed.append(i)
 			continue
 
 		var current_target: Vector2 = targets[i] if i < targets.size() else global_target
@@ -124,7 +140,8 @@ func run(state: Dictionary) -> Dictionary:
 		var moved_px: float = pos_now.distance_to(settler_last_pos[i])
 		settler_last_pos[i] = pos_now
 		var force_rethink: bool = false
-		if dist_to_target <= settler_arrival_rethink_distance_px and String(agent_last_state.get(i, "")) != "night_home":
+		var monitor_last_state: String = String(agent_last_state.get(i, ""))
+		if dist_to_target <= settler_arrival_rethink_distance_px and monitor_last_state != "night_home":
 			force_rethink = true
 		elif moved_px < settler_min_progress_px and dist_to_target > settler_arrival_rethink_distance_px * 1.5:
 			settler_idle_time[i] += delta
@@ -134,23 +151,35 @@ func run(state: Dictionary) -> Dictionary:
 			settler_idle_time[i] = 0.0
 
 		if force_rethink:
-			settler_next_think_time[i] = now_sec
+			if cb_set_next_think_time.is_valid():
+				cb_set_next_think_time.call(i, now_sec)
+			else:
+				settler_next_think_time[i] = now_sec
 			settler_think_state[i] = think_thinking
 
 		if now_sec < settler_next_think_time[i]:
 			if settler_think_state[i] != think_blocked:
 				settler_think_state[i] = think_executing
+			if settler_think_state[i] != prev_think_state:
+				indicator_changed.append(i)
 			continue
 
 		if not is_night and settler_decisions_this_tick >= decision_budget:
-			settler_next_think_time[i] = now_sec + 0.08 + abs(float(cb_think_jitter.call()))
+			var delayed_think_time: float = now_sec + 0.08 + abs(float(cb_think_jitter.call()))
+			if cb_set_next_think_time.is_valid():
+				cb_set_next_think_time.call(i, delayed_think_time)
+			else:
+				settler_next_think_time[i] = delayed_think_time
 			settler_think_state[i] = think_thinking
+			if settler_think_state[i] != prev_think_state:
+				indicator_changed.append(i)
 			continue
 
 		settler_idle_time[i] = 0.0
 		var pos: Vector2 = pos_now
 		var tile: Vector2i = cb_world_to_tile.call(pos)
 		var job: int = int(cb_job_for_settler.call(i))
+		var last_state: String = String(agent_last_state.get(i, ""))
 		if job != job_farm and job != job_lumber and job != job_stone:
 			cb_release_resource_claim.call(i)
 		var blocked: bool = false
@@ -161,10 +190,10 @@ func run(state: Dictionary) -> Dictionary:
 			settler_decisions_this_tick += 1
 			settler_think_state[i] = think_executing
 			cb_schedule_next_think.call(i, now_sec, false)
-			if String(agent_last_state.get(i, "")) != state_tag:
+			if last_state != state_tag:
 				agent_last_state[i] = state_tag
 				cb_record_agent_action.call(i, "Scouting point of interest")
-				cb_log_global_settler_event.call("state_change", i, cb_job_for_settler.call(i), state_tag, targets[i], "poi_scouting")
+				cb_log_global_settler_event.call("state_change", i, job, state_tag, targets[i], "poi_scouting")
 			continue
 
 		if job == job_farm:
@@ -220,6 +249,12 @@ func run(state: Dictionary) -> Dictionary:
 			var need_new2: bool = false
 			if cached2 == invalid_tile:
 				need_new2 = true
+			elif job == job_stone:
+				var cached_rt: int = int(cb_resource_type_at.call(cached2))
+				if cached_rt != res_stone and (not metal_mining_unlocked or cached_rt != res_metal):
+					need_new2 = true
+				elif float(cb_resource_left.call(cached2, cached_rt)) <= 0.0:
+					need_new2 = true
 			elif float(cb_resource_left.call(cached2, res_type)) <= 0.0:
 				need_new2 = true
 			elif tile.distance_to(cached2) <= 1.5:
@@ -235,7 +270,10 @@ func run(state: Dictionary) -> Dictionary:
 				else:
 					cached2 = invalid_tile
 				if cached2 == invalid_tile:
-					cached2 = cb_nearest_resource_tile.call(tile, res_type, i)
+					if job == job_stone and cb_nearest_mining_tile.is_valid():
+						cached2 = cb_nearest_mining_tile.call(tile, i)
+					else:
+						cached2 = cb_nearest_resource_tile.call(tile, res_type, i)
 				if cached2 == invalid_tile:
 					blocked = true
 					cached2 = camp_tile
@@ -257,7 +295,7 @@ func run(state: Dictionary) -> Dictionary:
 		settler_think_state[i] = think_blocked if blocked else think_executing
 		cb_schedule_next_think.call(i, now_sec, blocked)
 
-		if String(agent_last_state.get(i, "")) != state_tag:
+		if last_state != state_tag:
 			agent_last_state[i] = state_tag
 			if state_tag == "day_farm":
 				cb_record_agent_action.call(i, "Assigned to farming")
@@ -271,10 +309,12 @@ func run(state: Dictionary) -> Dictionary:
 				cb_record_agent_action.call(i, "Waiting for next decision")
 			else:
 				cb_record_agent_action.call(i, "Assigned to mining")
-			cb_log_global_settler_event.call("state_change", i, cb_job_for_settler.call(i), state_tag, targets[i], "target_reassigned")
+			cb_log_global_settler_event.call("state_change", i, job, state_tag, targets[i], "target_reassigned")
+		if settler_think_state[i] != prev_think_state:
+			indicator_changed.append(i)
 
 	if count > 0:
-		settler_decision_cursor = (settler_decision_cursor + max(1, decision_budget)) % count
+		settler_decision_cursor = (settler_decision_cursor + max(1, monitor_advance if monitor_advance > 0 else processed_steps)) % count
 
 	return {
 		"targets": targets,
@@ -285,4 +325,5 @@ func run(state: Dictionary) -> Dictionary:
 		"settler_idle_time": settler_idle_time,
 		"settler_last_pos": settler_last_pos,
 		"agent_last_state": agent_last_state,
+		"indicator_changed": indicator_changed,
 	}
