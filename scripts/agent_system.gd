@@ -59,6 +59,7 @@ var velocities: PackedVector2Array
 var _speed_multipliers: PackedFloat32Array
 var _agent_colors: PackedColorArray
 var _agent_targets: PackedVector2Array
+var _ignore_tile_capacity: PackedByteArray
 var _noise_phase: PackedFloat32Array
 var _noise_rate: PackedFloat32Array
 var _visual_dir: PackedVector2Array
@@ -305,14 +306,16 @@ func _step(delta: float) -> void:
 		var proposed: Vector2 = pos + vel * delta
 		var from_idx: int = _cell_index_from_world(pos)
 		var to_idx: int = _cell_index_from_world(proposed)
+		var ignore_capacity: bool = i < _ignore_tile_capacity.size() and _ignore_tile_capacity[i] != 0
 
 		if to_idx != from_idx:
-			if (not _walkable[to_idx]) or next_counts[to_idx] >= TILE_CAPACITY:
+			if (not _walkable[to_idx]) or (not ignore_capacity and next_counts[to_idx] >= TILE_CAPACITY):
 				proposed = pos
 				vel = Vector2.ZERO
 			else:
 				next_counts[from_idx] -= 1
-				next_counts[to_idx] += 1
+				if not ignore_capacity:
+					next_counts[to_idx] += 1
 
 		velocities[i] = vel
 		positions[i] = proposed
@@ -399,6 +402,12 @@ func set_agent_targets(targets: PackedVector2Array) -> void:
 	_agent_targets = targets
 
 
+func set_agent_capacity_ignore(values: PackedByteArray) -> void:
+	if values.size() != agent_count:
+		return
+	_ignore_tile_capacity = values
+
+
 func add_agents(count: int, spawn_center: Vector2 = Vector2.ZERO) -> void:
 	if count <= 0 or not infinite_mode:
 		return
@@ -414,6 +423,8 @@ func add_agents(count: int, spawn_center: Vector2 = Vector2.ZERO) -> void:
 	_noise_rate.resize(agent_count)
 	_visual_dir.resize(agent_count)
 	_agent_targets.resize(agent_count)
+	_ignore_tile_capacity.resize(agent_count)
+	_ignore_tile_capacity.fill(0)
 	_mmi.multimesh.instance_count = agent_count
 	_mmi.multimesh.visible_instance_count = agent_count
 
@@ -435,6 +446,43 @@ func add_agents(count: int, spawn_center: Vector2 = Vector2.ZERO) -> void:
 		var jitter_angle: float = rng.randf() * TAU
 		_visual_dir[i] = Vector2(cos(jitter_angle), sin(jitter_angle))
 		_mmi.multimesh.set_instance_transform_2d(i, Transform2D(0.0, pos))
+
+
+func remove_agents_by_indices(indices: PackedInt32Array) -> void:
+	if indices.is_empty() or agent_count <= 0:
+		return
+	var unique_sorted: Array[int] = []
+	var seen: Dictionary = {}
+	for idx_v in indices:
+		var idx: int = int(idx_v)
+		if idx < 0 or idx >= agent_count:
+			continue
+		if seen.has(idx):
+			continue
+		seen[idx] = true
+		unique_sorted.append(idx)
+	if unique_sorted.is_empty():
+		return
+	unique_sorted.sort()
+	for ri in range(unique_sorted.size() - 1, -1, -1):
+		var idx: int = unique_sorted[ri]
+		positions.remove_at(idx)
+		velocities.remove_at(idx)
+		if idx < _speed_multipliers.size():
+			_speed_multipliers.remove_at(idx)
+		if idx < _agent_colors.size():
+			_agent_colors.remove_at(idx)
+		if idx < _noise_phase.size():
+			_noise_phase.remove_at(idx)
+		if idx < _noise_rate.size():
+			_noise_rate.remove_at(idx)
+		if idx < _visual_dir.size():
+			_visual_dir.remove_at(idx)
+		if idx < _agent_targets.size():
+			_agent_targets.remove_at(idx)
+	agent_count = positions.size()
+	_mmi.multimesh.instance_count = agent_count
+	_mmi.multimesh.visible_instance_count = agent_count
 
 
 func _cell_index_from_world(world_pos: Vector2) -> int:

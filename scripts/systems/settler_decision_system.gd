@@ -67,6 +67,7 @@ func run(state: Dictionary) -> Dictionary:
 	var cb_job_for_settler: Callable = state["cb_job_for_settler"]
 	var cb_segment_world_target: Callable = state["cb_segment_world_target"]
 	var cb_home_center_for_settler: Callable = state["cb_home_center_for_settler"]
+	var cb_settler_has_home: Callable = state.get("cb_settler_has_home", Callable())
 	var cb_schedule_next_think: Callable = state["cb_schedule_next_think"]
 	var cb_set_next_think_time: Callable = state.get("cb_set_next_think_time", Callable())
 	var cb_release_resource_claim: Callable = state["cb_release_resource_claim"]
@@ -81,6 +82,7 @@ func run(state: Dictionary) -> Dictionary:
 	var cb_nearest_wildlife_pos: Callable = state["cb_nearest_wildlife_pos"]
 	var cb_nearest_resource_tile: Callable = state["cb_nearest_resource_tile"]
 	var cb_nearest_mining_tile: Callable = state.get("cb_nearest_mining_tile", Callable())
+	var cb_settler_wander_target: Callable = state.get("cb_settler_wander_target", Callable())
 	var indicator_changed: PackedInt32Array = PackedInt32Array()
 
 	var poi_idx: int = -1
@@ -110,7 +112,28 @@ func run(state: Dictionary) -> Dictionary:
 			if night_plan_budget > 0:
 				cb_update_day_plan_for_settler.call(i, cb_world_to_tile.call(pos_now), cb_job_for_settler.call(i))
 				night_plan_budget -= 1
-			if String(agent_last_state.get(i, "")) == "night_home" and now_sec < settler_next_think_time[i]:
+			var night_from_tile: Vector2i = cb_world_to_tile.call(pos_now)
+			var has_home: bool = bool(cb_settler_has_home.call(i)) if cb_settler_has_home.is_valid() else true
+			var night_target: Vector2 = cb_segment_world_target.call(night_from_tile, cb_home_center_for_settler.call(i))
+			state_tag = "night_home" if has_home else "night_camp"
+			if night_target.length_squared() <= 0.001 and cb_settler_wander_target.is_valid():
+				night_target = cb_settler_wander_target.call(i, night_from_tile)
+				state_tag = "night_wander"
+			var night_moved_px: float = pos_now.distance_to(settler_last_pos[i])
+			var night_dist_to_target: float = pos_now.distance_to(night_target)
+			if night_moved_px < settler_min_progress_px and night_dist_to_target > settler_arrival_rethink_distance_px * 1.5:
+				settler_idle_time[i] += delta
+				if settler_idle_time[i] >= settler_stuck_rethink_sec and cb_settler_wander_target.is_valid():
+					night_target = cb_settler_wander_target.call(i, night_from_tile)
+					state_tag = "night_wander"
+					settler_idle_time[i] = 0.0
+			else:
+				settler_idle_time[i] = 0.0
+			if state_tag == "night_wander" and cb_settler_wander_target.is_valid():
+				night_target = cb_settler_wander_target.call(i, night_from_tile)
+			targets[i] = night_target
+			var night_prev_state: String = String(agent_last_state.get(i, ""))
+			if (night_prev_state == "night_home" or night_prev_state == "night_camp" or night_prev_state == "night_wander") and now_sec < settler_next_think_time[i]:
 				if settler_think_state[i] != think_blocked:
 					settler_think_state[i] = think_executing
 				settler_idle_time[i] = 0.0
@@ -118,9 +141,6 @@ func run(state: Dictionary) -> Dictionary:
 				if settler_think_state[i] != prev_think_state:
 					indicator_changed.append(i)
 				continue
-			var night_from_tile: Vector2i = cb_world_to_tile.call(pos_now)
-			targets[i] = cb_segment_world_target.call(night_from_tile, cb_home_center_for_settler.call(i))
-			state_tag = "night_home"
 			settler_decisions_this_tick += 1
 			settler_think_state[i] = think_executing
 			settler_idle_time[i] = 0.0
@@ -129,8 +149,13 @@ func run(state: Dictionary) -> Dictionary:
 			if String(agent_last_state.get(i, "")) != state_tag:
 				agent_last_state[i] = state_tag
 				cb_release_resource_claim.call(i)
-				cb_record_agent_action.call(i, "Returning to home")
-				cb_log_global_settler_event.call("state_change", i, cb_job_for_settler.call(i), state_tag, targets[i], "night_return_home")
+				var return_label: String = "Wandering near camp"
+				var return_reason: String = "night_wander"
+				if state_tag != "night_wander":
+					return_label = "Returning to home" if has_home else "Returning to camp"
+					return_reason = "night_return_home" if has_home else "night_return_camp"
+				cb_record_agent_action.call(i, return_label)
+				cb_log_global_settler_event.call("state_change", i, cb_job_for_settler.call(i), state_tag, targets[i], return_reason)
 			if settler_think_state[i] != prev_think_state:
 				indicator_changed.append(i)
 			continue
@@ -291,6 +316,11 @@ func run(state: Dictionary) -> Dictionary:
 			else:
 				state_tag = "day_lumber" if job == job_lumber else "day_stone"
 
+		if targets[i].length_squared() <= 0.001 and cb_settler_wander_target.is_valid():
+			targets[i] = cb_settler_wander_target.call(i, tile)
+			blocked = true
+			state_tag = "day_wander"
+
 		settler_decisions_this_tick += 1
 		settler_think_state[i] = think_blocked if blocked else think_executing
 		cb_schedule_next_think.call(i, now_sec, blocked)
@@ -307,6 +337,8 @@ func run(state: Dictionary) -> Dictionary:
 				cb_record_agent_action.call(i, "Assigned to scouting")
 			elif state_tag == "day_blocked":
 				cb_record_agent_action.call(i, "Waiting for next decision")
+			elif state_tag == "day_wander":
+				cb_record_agent_action.call(i, "Wandering for fallback")
 			else:
 				cb_record_agent_action.call(i, "Assigned to mining")
 			cb_log_global_settler_event.call("state_change", i, job, state_tag, targets[i], "target_reassigned")

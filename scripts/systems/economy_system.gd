@@ -22,6 +22,7 @@ func run(state: Dictionary) -> Dictionary:
 	var convert_mult: float = float(state["convert_mult"])
 	var quarry_passive_mult: float = float(state["quarry_passive_mult"])
 	var storehouse_mult: float = float(state["storehouse_mult"])
+	var night_cooking_unlocked: bool = bool(state.get("night_cooking_unlocked", false))
 
 	var res_apple: int = int(state["res_apple"])
 	var res_berry_blue: int = int(state["res_berry_blue"])
@@ -54,7 +55,7 @@ func run(state: Dictionary) -> Dictionary:
 				house_tile_keys["%d:%d" % [manor_tile.x, manor_tile.y]] = true
 
 	harvest_tick += delta
-	if harvest_tick >= 0.35:
+	if harvest_tick >= 0.7:
 		harvest_tick = 0.0
 		cb_harvest_resources.call()
 
@@ -63,7 +64,7 @@ func run(state: Dictionary) -> Dictionary:
 		var consume: float = agent_count * food_consume_per_settler * food_consume_mult * delta
 		resources["food"] = maxf(0.0, float(resources["food"]) - consume)
 
-	if bool(cb_is_night.call()):
+	if bool(cb_is_night.call()) and night_cooking_unlocked:
 		var housed: int = mini(agent_count, int(cb_housing_capacity.call()))
 		if housed > 0 and float(resources["food"]) >= 1.0:
 			cook_tick += delta * housed

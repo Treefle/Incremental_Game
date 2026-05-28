@@ -220,6 +220,7 @@ const UPGRADE_DATA := {
 		{"id": "eff_speed", "name": "Road Kits", "effect": "Colonist speed +21% per rank", "cost": {"lumber": 52.0}, "max_rank": 5, "cost_scale": 1.73},
 		{"id": "eff_convert", "name": "Stone Saws", "effect": "Metal refining +60% per rank", "cost": {"lumber": 44.0, "stone": 28.0}, "max_rank": 4, "cost_scale": 1.79},
 		{"id": "eff_quarry_ops", "name": "Quarry Logistics", "effect": "Passive quarry stone trickle +72% per rank", "cost": {"lumber": 30.0, "stone": 20.0}, "max_rank": 4, "cost_scale": 1.73},
+		{"id": "eff_hearth", "name": "Camp Kitchens", "effect": "Unlock evening food cooking for housed settlers", "cost": {"food": 18.0, "lumber": 26.0}, "max_rank": 1, "cost_scale": 1.0},
 		{"id": "eff_ration", "name": "Strict Rationing", "effect": "Food use -24%, but happiness drops faster", "cost": {"food": 20.0, "metal": 18.0}, "max_rank": 3, "cost_scale": 1.96},
 		{"id": "eff_campfire", "name": "Campfire Stories", "effect": "Night happiness recovery +48%", "cost": {"food": 24.0, "lumber": 20.0}, "max_rank": 4, "cost_scale": 1.79},
 	],
@@ -378,6 +379,9 @@ var _settler_happiness: PackedFloat32Array
 var _happiness_gain_mult: float = 1.0
 var _happiness_loss_mult: float = 1.0
 var _hunting_yield_mult: float = 1.0
+var _night_cooking_unlocked: bool = false
+var _food_shortage_streak_sec: float = 0.0
+var _settler_starvation_time: PackedFloat32Array
 var _settler_attack_cooldowns: PackedFloat32Array
 var _settler_combat_tick_accum: float = 0.0
 var _settler_last_combat_log_msec: Dictionary = {}
@@ -475,6 +479,7 @@ var _agent_job_colors: PackedColorArray
 var _agent_job_colors_dirty: bool = true
 var _settler_decision_run_state: Dictionary = {}
 var _settler_candidate_seen: PackedByteArray = PackedByteArray()
+var _settler_capacity_ignore: PackedByteArray = PackedByteArray()
 
 
 func _ready() -> void:
@@ -653,6 +658,9 @@ func _process(delta: float) -> void:
 	step_start_us = Time.get_ticks_usec()
 	_update_hover_ui()
 	_perf_record_step("update_hover_ui", step_start_us)
+	step_start_us = Time.get_ticks_usec()
+	_update_starvation_deaths(delta)
+	_perf_record_step("update_starvation", step_start_us)
 	step_start_us = Time.get_ticks_usec()
 	_update_happiness(delta)
 	_perf_record_step("update_happiness", step_start_us)
@@ -1607,6 +1615,7 @@ func _update_economy(delta: float) -> void:
 		"convert_mult": _convert_mult,
 		"quarry_passive_mult": _quarry_passive_mult,
 		"storehouse_mult": _storehouse_mult,
+		"night_cooking_unlocked": _night_cooking_unlocked,
 		"res_apple": RES_APPLE,
 		"res_berry_blue": RES_BERRY_BLUE,
 		"res_berry_rasp": RES_BERRY_RASP,
@@ -1824,11 +1833,39 @@ func _has_housemate(index: int) -> bool:
 	return false
 
 
+func _update_starvation_deaths(delta: float) -> void:
+	var count: int = _agents.get_agent_count()
+	if count <= 0:
+		return
+	if _settler_starvation_time.size() != count:
+		var old_starve: PackedFloat32Array = _settler_starvation_time
+		_settler_starvation_time.resize(count)
+		for i in count:
+			_settler_starvation_time[i] = old_starve[i] if i < old_starve.size() else 0.0
+	if _resources["food"] > 0.0:
+		for i in count:
+			_settler_starvation_time[i] = maxf(0.0, _settler_starvation_time[i] - delta * 3.0)
+		return
+	var starvation_threshold: float = maxf(10.0, _day_length_seconds)
+	var casualties: PackedInt32Array = PackedInt32Array()
+	for i in count:
+		_settler_starvation_time[i] += delta
+		if _settler_starvation_time[i] >= starvation_threshold:
+			casualties.append(i)
+	if not casualties.is_empty():
+		_remove_settlers_by_indices(casualties, "starvation", _tile_center(_camp_tile))
+
+
 func _update_happiness(delta: float) -> void:
+	if _resources["food"] <= 0.0:
+		_food_shortage_streak_sec += delta
+	else:
+		_food_shortage_streak_sec = maxf(0.0, _food_shortage_streak_sec - delta * 2.0)
+	var starvation_mult: float = 1.0 + minf(1.0, _food_shortage_streak_sec / 90.0)
 	for i in _agents.get_agent_count():
 		var h: float = _settler_happiness[i]
 		if _resources["food"] <= 0.0:
-			h -= 0.06 * _happiness_loss_mult * delta
+			h -= 0.09 * starvation_mult * _happiness_loss_mult * delta
 		elif _is_night() and _has_housemate(i):
 			h += 0.04 * _happiness_gain_mult * delta
 		elif _is_night():
@@ -2478,9 +2515,23 @@ func _sync_agent_tracking() -> void:
 	var count: int = _agents.get_agent_count()
 	var previous_count: int = _tracked_agent_count if _tracked_agent_count >= 0 else _settler_names.size()
 	if previous_count == count and _settler_names.size() >= count:
-		return
+		var repaired: bool = false
+		for i in count:
+			var clean_name: String = _sanitize_settler_name(_settler_names[i], i)
+			if clean_name != _settler_names[i]:
+				_settler_names[i] = clean_name
+				repaired = true
+		if not repaired:
+			return
 	_tracked_agent_count = count
 	_sync_agent_tracking_on_population_change(count, previous_count)
+
+
+func _sanitize_settler_name(raw_name: String, settler_index: int) -> String:
+	var clean: String = raw_name.strip_edges()
+	if clean.is_empty():
+		return "Settler %d" % (settler_index + 1)
+	return clean
 
 
 func _roll_settler_name() -> String:
@@ -2488,11 +2539,12 @@ func _roll_settler_name() -> String:
 		return "Settler %d" % (_settler_names.size() + 1)
 	var pick_idx: int = _rng.randi_range(0, SETTLER_NAMES.size() - 1)
 	var guard: int = 0
-	while _settler_names.has(SETTLER_NAMES[pick_idx]) and guard < SETTLER_NAMES.size() * 2:
+	while (_settler_names.has(SETTLER_NAMES[pick_idx]) or String(SETTLER_NAMES[pick_idx]).strip_edges().is_empty()) and guard < SETTLER_NAMES.size() * 2:
 		pick_idx = _rng.randi_range(0, SETTLER_NAMES.size() - 1)
 		guard += 1
-	if not _settler_names.has(SETTLER_NAMES[pick_idx]):
-		return SETTLER_NAMES[pick_idx]
+	var candidate: String = String(SETTLER_NAMES[pick_idx]).strip_edges()
+	if not candidate.is_empty() and not _settler_names.has(candidate):
+		return candidate
 	return "Settler %d" % (_settler_names.size() + 1)
 
 
@@ -2511,20 +2563,28 @@ func _sync_agent_tracking_on_population_change(count: int, previous_count: int) 
 	_settler_weapons = _settler_mgr.weapons
 	_settler_tools = _settler_mgr.tools
 	_settler_tool_modes = _settler_mgr.tool_modes
+	if _settler_starvation_time.size() != count:
+		var old_starve: PackedFloat32Array = _settler_starvation_time
+		_settler_starvation_time.resize(count)
+		for i in count:
+			_settler_starvation_time[i] = old_starve[i] if i < old_starve.size() else 0.0
 	_apply_auto_tool_assignments()
 	_mark_tool_state_dirty()
 	_sync_settler_think_buffers(count)
 	_mark_settler_weapons_dirty()
 	_assign_default_jobs_for_new_settlers(previous_count, count)
+	_prime_new_settlers_for_immediate_work(previous_count, count)
 	for i in range(previous_count, count):
 		if not _agent_recent_actions.has(i):
 			_agent_recent_actions[i] = []
 		if not _agent_last_state.has(i):
 			_agent_last_state[i] = ""
 	while _settler_names.size() < count:
-		_settler_names.append(_roll_settler_name())
+		_settler_names.append(_sanitize_settler_name(_roll_settler_name(), _settler_names.size()))
 	if _settler_names.size() > count:
 		_settler_names.resize(count)
+	for i in _settler_names.size():
+		_settler_names[i] = _sanitize_settler_name(_settler_names[i], i)
 	if _pinned_agent_idx >= count:
 		_pinned_agent_idx = -1
 	if _agent_speed_multipliers.size() != count:
@@ -2562,6 +2622,39 @@ func _sync_agent_tracking_on_population_change(count: int, previous_count: int) 
 	_cleanup_resource_claims(count)
 
 
+func _prime_new_settlers_for_immediate_work(previous_count: int, count: int) -> void:
+	if count <= previous_count:
+		return
+	var now_sec: float = Time.get_ticks_msec() * 0.001
+	var is_night_now: bool = _is_night()
+	var agents: PackedVector2Array = _agents.get_agent_positions()
+	var targets: PackedVector2Array = _agents.get_agent_targets()
+	if targets.size() != count:
+		targets.resize(count)
+		for t in count:
+			targets[t] = _target
+	for i in range(previous_count, count):
+		if i >= _settler_next_think_time.size() or i >= _settler_think_state.size():
+			continue
+		_set_settler_next_think_time(i, now_sec)
+		_settler_think_state[i] = THINK_THINKING
+		if i < _settler_idle_time.size():
+			_settler_idle_time[i] = 0.0
+		if i < _settler_last_pos.size() and i < agents.size():
+			_settler_last_pos[i] = agents[i]
+		if is_night_now or i >= agents.size():
+			continue
+		var from_tile: Vector2i = _world_to_tile(agents[i])
+		var job: int = _job_for_settler(i)
+		_update_day_plan_for_settler(i, from_tile, job)
+		if _settler_day_plan_targets.has(i) and int(_settler_day_plan_job.get(i, -1)) == job:
+			var plan_tile: Vector2i = _settler_day_plan_targets[i]
+			var step_tile: Vector2i = _segment_target_toward(from_tile, plan_tile)
+			targets[i] = _tile_center(step_tile)
+	_agents.set_agent_targets(targets)
+	_active_indicator_settlers_dirty = true
+
+
 func _mark_settler_weapons_dirty() -> void:
 	_settler_weapons_dirty = true
 
@@ -2575,6 +2668,218 @@ func _refresh_settler_weapons_if_dirty() -> void:
 
 func _cleanup_resource_claims(settler_count: int) -> void:
 	_resource_mgr.cleanup_claims(settler_count, Callable(self, "_tile_key"))
+
+
+func _remap_indexed_dictionary(source: Dictionary, old_to_new: PackedInt32Array) -> Dictionary:
+	var remapped: Dictionary = {}
+	for key_v in source.keys():
+		var old_idx: int = int(key_v)
+		if old_idx < 0 or old_idx >= old_to_new.size():
+			continue
+		var new_idx: int = int(old_to_new[old_idx])
+		if new_idx < 0:
+			continue
+		remapped[new_idx] = source[key_v]
+	return remapped
+
+
+func _replace_dictionary_in_place(target: Dictionary, replacement: Dictionary) -> void:
+	target.clear()
+	for key_v in replacement.keys():
+		target[key_v] = replacement[key_v]
+
+
+func _remove_settlers_by_indices(indices: PackedInt32Array, reason: String, source_pos: Vector2 = Vector2.ZERO) -> int:
+	var old_count: int = _agents.get_agent_count()
+	if old_count <= 0 or indices.is_empty():
+		return 0
+	var remove_flags: PackedByteArray = PackedByteArray()
+	remove_flags.resize(old_count)
+	remove_flags.fill(0)
+	var unique_sorted: PackedInt32Array = PackedInt32Array()
+	var kill_count: int = 0
+	for idx_v in indices:
+		var idx: int = int(idx_v)
+		if idx < 0 or idx >= old_count:
+			continue
+		if remove_flags[idx] == 1:
+			continue
+		remove_flags[idx] = 1
+		unique_sorted.append(idx)
+		kill_count += 1
+	if kill_count <= 0:
+		return 0
+	unique_sorted.sort()
+
+	var old_to_new: PackedInt32Array = PackedInt32Array()
+	old_to_new.resize(old_count)
+	old_to_new.fill(-1)
+	var survivor_idx: int = 0
+	for i in old_count:
+		if remove_flags[i] == 1:
+			continue
+		old_to_new[i] = survivor_idx
+		survivor_idx += 1
+
+	for i in unique_sorted.size():
+		var dead_idx: int = int(unique_sorted[i])
+		_release_resource_claim(dead_idx)
+
+	var old_happiness: PackedFloat32Array = _settler_happiness
+	var old_attack_cooldowns: PackedFloat32Array = _settler_attack_cooldowns
+	var old_weapons: PackedInt32Array = _settler_weapons
+	var old_tools: PackedInt32Array = _settler_tools
+	var old_tool_modes: PackedInt32Array = _settler_tool_modes
+	var old_next_think_time: PackedFloat32Array = _settler_next_think_time
+	var old_think_state: PackedInt32Array = _settler_think_state
+	var old_last_pos: PackedVector2Array = _settler_last_pos
+	var old_idle_time: PackedFloat32Array = _settler_idle_time
+	var old_homes: PackedInt32Array = _settler_homes
+	var old_starvation: PackedFloat32Array = _settler_starvation_time
+	var old_speed: PackedFloat32Array = _agent_speed_multipliers
+	var old_colors: PackedColorArray = _agent_job_colors
+	var old_names: Array[String] = _settler_names.duplicate()
+
+	var new_count: int = old_count - kill_count
+	var new_happiness: PackedFloat32Array = PackedFloat32Array()
+	new_happiness.resize(new_count)
+	var new_attack_cooldowns: PackedFloat32Array = PackedFloat32Array()
+	new_attack_cooldowns.resize(new_count)
+	var new_weapons: PackedInt32Array = PackedInt32Array()
+	new_weapons.resize(new_count)
+	var new_tools: PackedInt32Array = PackedInt32Array()
+	new_tools.resize(new_count)
+	var new_tool_modes: PackedInt32Array = PackedInt32Array()
+	new_tool_modes.resize(new_count)
+	var new_next_think_time: PackedFloat32Array = PackedFloat32Array()
+	new_next_think_time.resize(new_count)
+	var new_think_state: PackedInt32Array = PackedInt32Array()
+	new_think_state.resize(new_count)
+	var new_last_pos: PackedVector2Array = PackedVector2Array()
+	new_last_pos.resize(new_count)
+	var new_idle_time: PackedFloat32Array = PackedFloat32Array()
+	new_idle_time.resize(new_count)
+	var new_homes: PackedInt32Array = PackedInt32Array()
+	new_homes.resize(new_count)
+	var new_starvation: PackedFloat32Array = PackedFloat32Array()
+	new_starvation.resize(new_count)
+	var new_speed: PackedFloat32Array = PackedFloat32Array()
+	new_speed.resize(new_count)
+	var new_colors: PackedColorArray = PackedColorArray()
+	new_colors.resize(new_count)
+	var new_names: Array[String] = []
+
+	for old_idx in old_count:
+		var new_idx: int = int(old_to_new[old_idx])
+		if new_idx < 0:
+			continue
+		new_happiness[new_idx] = old_happiness[old_idx] if old_idx < old_happiness.size() else 0.5
+		new_attack_cooldowns[new_idx] = old_attack_cooldowns[old_idx] if old_idx < old_attack_cooldowns.size() else 0.0
+		new_weapons[new_idx] = old_weapons[old_idx] if old_idx < old_weapons.size() else WEAPON_SPEAR
+		new_tools[new_idx] = old_tools[old_idx] if old_idx < old_tools.size() else TOOL_HAND
+		new_tool_modes[new_idx] = old_tool_modes[old_idx] if old_idx < old_tool_modes.size() else TOOL_MODE_AUTO
+		new_next_think_time[new_idx] = old_next_think_time[old_idx] if old_idx < old_next_think_time.size() else 0.0
+		new_think_state[new_idx] = old_think_state[old_idx] if old_idx < old_think_state.size() else THINK_THINKING
+		new_last_pos[new_idx] = old_last_pos[old_idx] if old_idx < old_last_pos.size() else Vector2.ZERO
+		new_idle_time[new_idx] = old_idle_time[old_idx] if old_idx < old_idle_time.size() else 0.0
+		new_homes[new_idx] = old_homes[old_idx] if old_idx < old_homes.size() else -1
+		new_starvation[new_idx] = old_starvation[old_idx] if old_idx < old_starvation.size() else 0.0
+		new_speed[new_idx] = old_speed[old_idx] if old_idx < old_speed.size() else 1.0
+		new_colors[new_idx] = old_colors[old_idx] if old_idx < old_colors.size() else Color(0.35, 0.9, 1.0, 1.0)
+		var source_name: String = old_names[old_idx] if old_idx < old_names.size() else ""
+		new_names.append(_sanitize_settler_name(source_name, new_idx))
+
+	var remapped_recent_actions: Dictionary = _remap_indexed_dictionary(_agent_recent_actions, old_to_new)
+	var remapped_last_state: Dictionary = _remap_indexed_dictionary(_agent_last_state, old_to_new)
+	var remapped_resource_targets: Dictionary = _remap_indexed_dictionary(_settler_resource_targets, old_to_new)
+	var remapped_day_plan_targets: Dictionary = _remap_indexed_dictionary(_settler_day_plan_targets, old_to_new)
+	var remapped_day_plan_job: Dictionary = _remap_indexed_dictionary(_settler_day_plan_job, old_to_new)
+	var remapped_job_overrides: Dictionary = _remap_indexed_dictionary(_settler_job_overrides, old_to_new)
+	var remapped_boost_until: Dictionary = _remap_indexed_dictionary(_hunter_boost_until, old_to_new)
+	var remapped_rest_until: Dictionary = _remap_indexed_dictionary(_hunter_rest_until, old_to_new)
+	var remapped_runtime_state: Dictionary = _remap_indexed_dictionary(_hunter_runtime_state, old_to_new)
+
+	var remapped_claims: Dictionary = {}
+	for key_v in _resource_claims.keys():
+		var owner: int = int(_resource_claims[key_v])
+		if owner < 0 or owner >= old_to_new.size():
+			continue
+		var new_owner: int = int(old_to_new[owner])
+		if new_owner < 0:
+			continue
+		remapped_claims[key_v] = new_owner
+
+	_agents.remove_agents_by_indices(unique_sorted)
+
+	_settler_mgr.happiness = new_happiness
+	_settler_mgr.attack_cooldowns = new_attack_cooldowns
+	_settler_mgr.weapons = new_weapons
+	_settler_mgr.tools = new_tools
+	_settler_mgr.tool_modes = new_tool_modes
+	_settler_mgr.next_think_time = new_next_think_time
+	_settler_mgr.think_state = new_think_state
+	_settler_mgr.last_pos = new_last_pos
+	_settler_mgr.idle_time = new_idle_time
+
+	_settler_happiness = _settler_mgr.happiness
+	_settler_attack_cooldowns = _settler_mgr.attack_cooldowns
+	_settler_weapons = _settler_mgr.weapons
+	_settler_tools = _settler_mgr.tools
+	_settler_tool_modes = _settler_mgr.tool_modes
+	_settler_next_think_time = _settler_mgr.next_think_time
+	_settler_think_state = _settler_mgr.think_state
+	_settler_last_pos = _settler_mgr.last_pos
+	_settler_idle_time = _settler_mgr.idle_time
+	_settler_homes = new_homes
+	_settler_starvation_time = new_starvation
+	_settler_names = new_names
+	_agent_speed_multipliers = new_speed
+	_agent_job_colors = new_colors
+
+	_agent_recent_actions = remapped_recent_actions
+	_agent_last_state = remapped_last_state
+	_settler_job_overrides = remapped_job_overrides
+	_hunter_boost_until = remapped_boost_until
+	_hunter_rest_until = remapped_rest_until
+	_hunter_runtime_state = remapped_runtime_state
+	_replace_dictionary_in_place(_settler_resource_targets, remapped_resource_targets)
+	_replace_dictionary_in_place(_settler_day_plan_targets, remapped_day_plan_targets)
+	_replace_dictionary_in_place(_settler_day_plan_job, remapped_day_plan_job)
+	_replace_dictionary_in_place(_resource_claims, remapped_claims)
+	_sync_resource_claim_ids()
+	_cleanup_resource_claims(new_count)
+
+	var remapped_hover: int = _hovered_agent_idx
+	if remapped_hover >= 0 and remapped_hover < old_to_new.size():
+		_hovered_agent_idx = int(old_to_new[remapped_hover])
+	else:
+		_hovered_agent_idx = -1
+	var remapped_pinned: int = _pinned_agent_idx
+	if remapped_pinned >= 0 and remapped_pinned < old_to_new.size():
+		_pinned_agent_idx = int(old_to_new[remapped_pinned])
+	else:
+		_pinned_agent_idx = -1
+
+	_settler_due_buckets.clear()
+	_settler_due_versions.resize(new_count)
+	_settler_due_versions.fill(0)
+	_rebuild_settler_due_queue(Time.get_ticks_msec() * 0.001, new_count)
+	_settler_candidate_seen.resize(new_count)
+	_settler_candidate_seen.fill(0)
+	_active_indicator_settlers.resize(0)
+	_active_indicator_settler_pos.clear()
+	_active_indicator_settlers_dirty = true
+	_tracked_agent_count = new_count
+	_clamp_job_counts()
+	_recompute_homes()
+	_mark_settler_weapons_dirty()
+	_mark_tool_state_dirty()
+	_spawn_floating_text(source_pos if source_pos != Vector2.ZERO else _tile_center(_camp_tile), "-%d settler" % kill_count, Color(1.0, 0.35, 0.3, 1.0))
+	if new_count <= 0:
+		_spawn_floating_text(_tile_center(_camp_tile), "Colony wiped out", Color(1.0, 0.2, 0.2, 1.0))
+	else:
+		_record_agent_action(0, "%d settler lost (%s)" % [kill_count, reason])
+	return kill_count
 
 
 func _mark_tool_state_dirty() -> void:
@@ -2742,6 +3047,10 @@ func _sync_settler_due_queue(count: int, now_sec: float) -> void:
 		_settler_due_versions.resize(count)
 		for i in count:
 			_settler_due_versions[i] = old_versions[i] if i < old_versions.size() else 0
+		_rebuild_settler_due_queue(now_sec, count)
+		return
+	if count > 0 and _settler_due_buckets.is_empty():
+		# Safety net: if buckets are cleared unexpectedly, settlers can stop receiving decisions.
 		_rebuild_settler_due_queue(now_sec, count)
 
 
@@ -3204,6 +3513,8 @@ func _bootstrap_10k_stress_test() -> void:
 		return
 	if _agents.infinite_mode:
 		_agents.add_agents(target_count - current_count, _target)
+		_recompute_homes()
+		_sync_agent_tracking()
 		_record_agent_action(0, "Stress test enabled: scaled settlers to %d" % target_count)
 	else:
 		push_warning("10k stress test requires AgentSystem.infinite_mode=true or a preconfigured agent_count >= target")
@@ -3392,7 +3703,8 @@ func _update_hover_ui() -> void:
 	var tool_mode: String = _tool_mode_name_for_settler(i)
 
 	var pinned_tag: String = " (Pinned)" if i == _pinned_agent_idx else ""
-	var settler_name: String = _settler_names[i] if i < _settler_names.size() else "Settler %d" % (i + 1)
+	var raw_name: String = _settler_names[i] if i < _settler_names.size() else ""
+	var settler_name: String = _sanitize_settler_name(raw_name, i)
 	_hover_title_label.text = "%s%s" % [settler_name, pinned_tag]
 	_hover_body_label.text = (
 		"State: %s\n"
@@ -3527,7 +3839,8 @@ func _show_home_hover(home_slot: int, is_manor: bool) -> void:
 	var residents: Array[String] = []
 	for i in _settler_homes.size():
 		if int(_settler_homes[i]) == home_slot:
-			var name_str: String = _settler_names[i] if i < _settler_names.size() else "Settler %d" % (i + 1)
+			var raw_name: String = _settler_names[i] if i < _settler_names.size() else ""
+			var name_str: String = _sanitize_settler_name(raw_name, i)
 			residents.append(name_str)
 
 	if is_manor:
@@ -4614,6 +4927,12 @@ func _home_center_for_settler(index: int) -> Vector2:
 	return _home_center_for_slot(home_idx)
 
 
+func _settler_has_home(index: int) -> bool:
+	if index < 0 or index >= _settler_homes.size():
+		return false
+	return _settler_homes[index] >= 0
+
+
 func _is_tile_claimed_by_other(tile: Vector2i, settler_index: int) -> bool:
 	return _resource_mgr.is_tile_claimed_by_other(_tile_key(tile), settler_index, _tile_id(tile))
 
@@ -4720,6 +5039,24 @@ func _segment_world_target(from_tile: Vector2i, goal_world: Vector2) -> Vector2:
 	var goal_tile: Vector2i = _world_to_tile(goal_world)
 	var move_tile: Vector2i = _segment_target_toward(from_tile, goal_tile)
 	return _tile_center(move_tile)
+
+
+func _settler_wander_target(settler_index: int, from_tile: Vector2i) -> Vector2:
+	var directions: Array[Vector2i] = [
+		Vector2i(1, 0), Vector2i(1, 1), Vector2i(0, 1), Vector2i(-1, 1),
+		Vector2i(-1, 0), Vector2i(-1, -1), Vector2i(0, -1), Vector2i(1, -1),
+	]
+	var start: int = absi(settler_index) % directions.size()
+	var base_step: int = maxi(1, settler_route_segment_tiles)
+	for ring in range(1, 4):
+		var step: int = base_step * ring
+		for offset in directions.size():
+			var dir: Vector2i = directions[(start + offset) % directions.size()]
+			var candidate: Vector2i = from_tile + dir * step
+			if _is_structure_tile_occupied(candidate):
+				continue
+			return _tile_center(candidate)
+	return _tile_center(from_tile)
 
 
 func _nearest_resource_tile(from_tile: Vector2i, res_type: int, claimant_index: int = -1, max_radius: int = 26) -> Vector2i:
@@ -5217,8 +5554,14 @@ func _update_settler_targets(delta: float) -> void:
 		var indicator_index: int = int(idx)
 		_set_active_indicator_state(indicator_index, indicator_index < _settler_think_state.size() and _settler_think_state[indicator_index] == THINK_THINKING)
 	targets = result["targets"]
+	if _settler_capacity_ignore.size() != count:
+		_settler_capacity_ignore.resize(count)
+	for i in count:
+		var state_tag: String = String(_agent_last_state.get(i, ""))
+		_settler_capacity_ignore[i] = 1 if (state_tag.begins_with("night_") or state_tag.ends_with("_night")) else 0
 	_update_hunter_movement_states(agents, targets, now_sec, is_night)
 	_agents.set_agent_targets(targets)
+	_agents.set_agent_capacity_ignore(_settler_capacity_ignore)
 	_agents.set_agent_speed_multipliers(_agent_speed_multipliers)
 	_refresh_active_indicator_settlers(count)
 
@@ -5710,6 +6053,9 @@ func _apply_upgrade_effect(id: String) -> void:
 			_convert_mult *= 1.60
 		"eff_quarry_ops":
 			_quarry_passive_mult *= 1.72
+		"eff_hearth":
+			_night_cooking_unlocked = true
+			_spawn_floating_text(_tile_center(_camp_tile), "Camp kitchens ready", Color(0.95, 0.74, 0.3, 1.0))
 		"eff_ration":
 			_food_consume_mult *= 0.76
 			_happiness_loss_mult *= 1.12
@@ -5935,7 +6281,9 @@ func _init_settler_decision_run_state() -> void:
 		"cb_world_to_tile": Callable(self, "_world_to_tile"),
 		"cb_job_for_settler": Callable(self, "_job_for_settler"),
 		"cb_segment_world_target": Callable(self, "_segment_world_target"),
+		"cb_settler_wander_target": Callable(self, "_settler_wander_target"),
 		"cb_home_center_for_settler": Callable(self, "_home_center_for_settler"),
+		"cb_settler_has_home": Callable(self, "_settler_has_home"),
 		"cb_schedule_next_think": Callable(self, "_schedule_next_think"),
 		"cb_set_next_think_time": Callable(self, "_set_settler_next_think_time"),
 		"cb_release_resource_claim": Callable(self, "_release_resource_claim"),
@@ -6453,8 +6801,11 @@ func _apply_predator_strike(strike_pos: Vector2, predator_type: int) -> void:
 		return
 	var radius: float = 24.0 if predator_type == ANIMAL_WOLF else 30.0
 	var base_hit: float = 0.05 if predator_type == ANIMAL_WOLF else 0.085
+	var base_lethal_chance: float = 0.065 if predator_type == ANIMAL_WOLF else 0.14
 	if _wolf_raid_active:
 		base_hit *= 1.0 + _combat_neglect_level() * 0.35
+		base_lethal_chance *= 1.0 + _combat_neglect_level() * 0.35
+	var casualties: PackedInt32Array = PackedInt32Array()
 	for i in agents.size():
 		var d: float = agents[i].distance_to(strike_pos)
 		if d > radius:
@@ -6463,6 +6814,12 @@ func _apply_predator_strike(strike_pos: Vector2, predator_type: int) -> void:
 		var morale_hit: float = base_hit / defense
 		if i < _settler_happiness.size():
 			_settler_happiness[i] = clampf(_settler_happiness[i] - morale_hit, 0.0, 1.0)
+		var lethal_chance: float = clampf(base_lethal_chance / defense, 0.01, 0.42)
+		if _rng.randf() < lethal_chance:
+			casualties.append(i)
+	if not casualties.is_empty():
+		var cause: String = "wolf attack" if predator_type == ANIMAL_WOLF else "bear attack"
+		_remove_settlers_by_indices(casualties, cause, strike_pos)
 
 
 func _try_raze_structure(strike_pos: Vector2, predator_type: int) -> void:
