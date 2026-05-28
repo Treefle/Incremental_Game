@@ -272,19 +272,31 @@ func _step(delta: float) -> void:
 	var spd: float = tiles_per_second * float(CELL_SIZE)
 	var t: float = Time.get_ticks_msec() * 0.001
 	var next_counts := _tile_counts.duplicate()
+	var has_agent_targets: bool = _agent_targets.size() == agent_count
 	for i in agent_count:
 		var speed_mult: float = 1.0
 		if _speed_multipliers.size() == agent_count:
 			speed_mult = maxf(0.0, _speed_multipliers[i])
 		var pos: Vector2 = positions[i]
+		var target: Vector2 = _target_world
+		if has_agent_targets:
+			target = _agent_targets[i]
 		var dir: Vector2 = _flow.sample(pos)
 		var vel := Vector2.ZERO
-		var to_target: Vector2 = _target_world - pos
+		var to_target: Vector2 = target - pos
 		var dist: float = to_target.length()
 		var settle_radius_px: float = settle_radius_tiles * float(CELL_SIZE)
 		var settle_band_px: float = settle_band_tiles * float(CELL_SIZE)
 
-		if dir.length_squared() > 0.01:
+		if has_agent_targets:
+			if dist > 3.0:
+				var base_dir: Vector2 = to_target / dist
+				if direction_noise > 0.0:
+					var phase: float = _noise_phase[i] + t * _noise_rate[i]
+					var noise_dir := Vector2(cos(phase), sin(phase))
+					base_dir = (base_dir + noise_dir * direction_noise * 0.5).normalized()
+				vel = base_dir * (spd * speed_mult)
+		elif dir.length_squared() > 0.01:
 			# Ring settle behavior: near destination, steer toward a circular shell.
 			var base_dir: Vector2 = dir.normalized()
 			if dist < (settle_radius_px + settle_band_px) and dist > 0.001:
@@ -348,10 +360,10 @@ func _flush_render() -> void:
 ## Cost: O(grid_cells) — safe to call on click events, not every frame.
 func set_target(world_pos: Vector2) -> void:
 	_target_world = world_pos
+	if _agent_targets.size() == agent_count:
+		for i in agent_count:
+			_agent_targets[i] = world_pos
 	if infinite_mode:
-		if _agent_targets.size() == agent_count:
-			for i in agent_count:
-				_agent_targets[i] = world_pos
 		return
 	_pending_flow_target_world = world_pos
 	_flow_dirty = true
