@@ -5619,6 +5619,14 @@ func _reassign_one_to(target_job: String) -> bool:
 	return false
 
 
+func _clear_resource_on_build_tile(tile: Vector2i) -> void:
+	var id: int = _tile_id(tile)
+	var key: String = _tile_key(tile)
+	if not _resource_remaining_id.has(id) and not _resource_remaining.has(key) and _resource_type_at(tile) == RES_NONE:
+		return
+	_set_resource_left(tile, 0.0)
+
+
 func _place_building_near_target(id: String) -> void:
 	var tile_array: Array[Vector2i]
 	match id:
@@ -5639,6 +5647,7 @@ func _place_building_near_target(id: String) -> void:
 				if _is_structure_tile_occupied(tile):
 					continue
 				tile_array.append(tile)
+				_clear_resource_on_build_tile(tile)
 				_reveal_around_tile(tile, 3)
 				return
 
@@ -5653,12 +5662,8 @@ func _place_house_near_target() -> void:
 				if _is_structure_tile_occupied(tile):
 					continue
 				_house_tiles.append(tile)
+				_clear_resource_on_build_tile(tile)
 				_reveal_around_tile(tile, 3)
-				# Clear any resources on this tile
-				var res_key: String = _tile_key(tile)
-				var res_id: int = _tile_id(tile)
-				_resource_remaining.erase(res_key)
-				_resource_remaining_id.erase(res_id)
 				return
 
 
@@ -5675,7 +5680,9 @@ func _place_manor_near_target() -> void:
 				_manor_origins.append(origin)
 				for dx in MANOR_FOOTPRINT:
 					for dy in MANOR_FOOTPRINT:
-						_reveal_around_tile(origin + Vector2i(dx, dy), 3)
+						var tile: Vector2i = origin + Vector2i(dx, dy)
+						_clear_resource_on_build_tile(tile)
+						_reveal_around_tile(tile, 3)
 				return
 
 
